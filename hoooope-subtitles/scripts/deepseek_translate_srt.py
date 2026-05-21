@@ -1,0 +1,336 @@
+﻿from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+import requests
+
+
+TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}$")
+JA_RE = re.compile(r"[\u3040-\u30ff]")
+
+
+def read_blocks(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8-sig")
+    return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
+
+
+def write_blocks(path: Path, blocks: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n\n".join(blocks).strip() + "\n", encoding="utf-8-sig")
+
+
+def block_header(block: str) -> tuple[str, str]:
+    lines = block.splitlines()
+    if len(lines) < 3:
+        raise ValueError(f"Bad SRT block:\n{block}")
+    return lines[0].strip(), lines[1].strip()
+
+
+def validate_blocks(blocks: list[str], expected_blocks: list[str] | None = None) -> list[str]:
+    errors: list[str] = []
+    for idx, block in enumerate(blocks):
+        lines = block.splitlines()
+        if len(lines) < 3:
+            errors.append(f"block {idx + 1}: too few lines")
+            continue
+        number = lines[0].strip()
+        timing = lines[1].strip()
+        if not number.isdigit():
+            errors.append(f"block {idx + 1}: invalid number {number!r}")
+        if not TIME_RE.match(timing):
+            errors.append(f"block {idx + 1}: invalid timestamp {timing!r}")
+        if expected_blocks is not None:
+            exp_number, exp_timing = block_header(expected_blocks[idx])
+            if number != exp_number:
+                errors.append(f"block {idx + 1}: number changed {number!r} != {exp_number!r}")
+            if timing != exp_timing:
+                errors.append(f"block {idx + 1}: timestamp changed {timing!r} != {exp_timing!r}")
+    return errors
+
+
+def bundled_reference_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "references" / "terms-and-notes.md"
+
+
+def load_glossary(paths: list[Path]) -> str:
+    parts: list[str] = []
+    all_paths = [bundled_reference_path(), *paths]
+    seen: set[Path] = set()
+    for path in all_paths:
+        path = path.resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.exists():
+            parts.append(path.read_text(encoding="utf-8-sig").strip())
+    return "\n\n".join(part for part in parts if part)
+
+
+def strip_code_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def translate_chunk(
+    blocks: list[str],
+    glossary: str,
+    args: argparse.Namespace,
+    chunk_index: int,
+) -> list[str]:
+    source = "\n\n".join(blocks)
+    system_prompt = "你是专业的日语到简体中文字幕译者。只输出有效 SRT，不要解释。"
+    user_prompt = f"""你正在翻译声优广播节目《羊宫妃那的 HOOOOPE》。
+
+任务：把下面的日语 SRT 分块翻译成自然、流畅的简体中文。
+
+硬性要求：
+1. 保留每一条 SRT 编号不变。
+2. 保留每一条时间轴不变。
+3. 只翻译字幕正文，不要改编号、时间轴、空行结构。
+4. 不要总结，不要省略，不要合并字幕段，不要新增字幕段。
+5. 节目名统一为 HOOOOPE。
+6. 主持人统一为羊宫妃那。
+7. 听众来信要像中文投稿，主持人回应要像自然口播。
+8. 不确定的节目固定词、广播名、昵称，优先保留原名或音译，不要乱译。
+9. 日语接龙、双关、玩笑要让中文观众能理解，但不要写成长解释。
+10. 输出只能是完整 SRT，不要 Markdown，不要代码块，不要解释。
+
+项目术语表：
+{glossary or "(none)"}
+
+SRT 分块：
+{source}
+"""
+    payload = {
+        "model": args.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": args.temperature,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {args.api_key}",
+        "Content-Type": "application/json",
+    }
+    url = args.base_url.rstrip("/") + "/chat/completions"
+
+    last_error = None
+    for attempt in range(1, args.retries + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=args.timeout)
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            translated = read_blocks_from_text(strip_code_fence(content))
+
+            if len(translated) != len(blocks):
+                raise ValueError(f"chunk {chunk_index}: block count changed {len(translated)} != {len(blocks)}")
+            errors = validate_blocks(translated, blocks)
+            if errors:
+                raise ValueError("; ".join(errors[:5]))
+            return translated
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            wait = min(args.retry_wait * attempt, 30)
+            print(f"chunk {chunk_index}: attempt {attempt} failed: {exc}")
+            if attempt < args.retries:
+                time.sleep(wait)
+
+    raise RuntimeError(f"chunk {chunk_index} failed after {args.retries} attempts: {last_error}")
+
+
+def read_blocks_from_text(text: str) -> list[str]:
+    return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
+
+
+def chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def block_number(block: str) -> int:
+    return int(block.splitlines()[0].strip())
+
+
+def block_text(block: str) -> str:
+    return "\n".join(block.splitlines()[2:]).strip()
+
+
+def qa_report(source_blocks: list[str], zh_blocks: list[str], sample_ratio: float) -> str:
+    issues: list[str] = []
+    issue_numbers: set[int] = set()
+
+    def add_issue(title: str, number: int, ja: str, zh: str, detail: str = "") -> None:
+        issue_numbers.add(number)
+        issues.append(
+            "\n".join(
+                [
+                    f"[{title}] #{number}" + (f" - {detail}" if detail else ""),
+                    "JA: " + block_text(ja).replace("\n", " / "),
+                    "ZH: " + block_text(zh).replace("\n", " / "),
+                    "",
+                ]
+            )
+        )
+
+    for ja, zh in zip(source_blocks, zh_blocks):
+        num = block_number(ja)
+        ztext = block_text(zh)
+        if not ztext:
+            add_issue("空字幕", num, ja, zh)
+        if JA_RE.search(ztext):
+            add_issue("疑似日文残留", num, ja, zh)
+        if "HOPE" in ztext and "HOOOOPE" not in ztext:
+            add_issue("节目名疑似错误", num, ja, zh)
+        for bad in ("阳宫", "雏乃", "陽宮", "ひなの"):
+            if bad in ztext:
+                add_issue("人名疑似错误", num, ja, zh, bad)
+                break
+        if len(ztext.replace("\n", "")) > 48:
+            add_issue("字幕偏长", num, ja, zh, f"{len(ztext.replace(chr(10), ''))} chars")
+
+    total = len(source_blocks)
+    sample_count = max(12, int(total * sample_ratio))
+    sample_numbers = sorted(
+        {
+            1,
+            2,
+            3,
+            total,
+            max(1, total - 1),
+            max(1, total // 4),
+            max(1, total // 2),
+            max(1, total * 3 // 4),
+        }
+    )
+    if sample_count > len(sample_numbers):
+        step = max(1, total // max(1, sample_count - len(sample_numbers)))
+        sample_numbers.extend(range(1, total + 1, step))
+    sample_numbers = sorted(set(n for n in sample_numbers if 1 <= n <= total and n not in issue_numbers))
+    sample_numbers = sample_numbers[:sample_count]
+
+    samples: list[str] = []
+    for number in sample_numbers:
+        ja = source_blocks[number - 1]
+        zh = zh_blocks[number - 1]
+        samples.append(
+            "\n".join(
+                [
+                    f"[抽样审核] #{number}",
+                    "JA: " + block_text(ja).replace("\n", " / "),
+                    "ZH: " + block_text(zh).replace("\n", " / "),
+                    "",
+                ]
+            )
+        )
+
+    header = [
+        "HOOOOPE DeepSeek translation QA report",
+        f"blocks={total}",
+        f"issues={len(issue_numbers)}",
+        f"samples={len(sample_numbers)}",
+        "",
+        "Codex review policy:",
+        "- Review every issue block.",
+        "- Review sampled blocks for tone and terminology.",
+        "- Do not re-read the full SRT unless the QA report shows systemic failure.",
+        "",
+    ]
+    return "\n".join(header + issues + samples).strip() + "\n"
+
+
+def translate(args: argparse.Namespace) -> None:
+    src = Path(args.input)
+    out = Path(args.output)
+    if not args.api_key:
+        raise SystemExit("Missing API key. Set DEEPSEEK_API_KEY or pass --api-key.")
+
+    blocks = read_blocks(src)
+    source_errors = validate_blocks(blocks)
+    if source_errors:
+        raise SystemExit("Source SRT validation failed:\n" + "\n".join(source_errors[:20]))
+
+    glossary_paths = [Path(p) for p in args.glossary]
+    glossary = load_glossary(glossary_paths)
+    chunk_list = chunks(blocks, args.chunk_size)
+
+    cache_dir = Path(args.cache_dir) if args.cache_dir else src.parent / "deepseek_chunks" / src.stem
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    translated_all: list[str] = []
+    for idx, chunk_blocks in enumerate(chunk_list, start=1):
+        cache_file = cache_dir / f"{src.stem}.part{idx:03d}.zh.srt"
+        if cache_file.exists() and not args.force:
+            cached = read_blocks(cache_file)
+            if len(cached) == len(chunk_blocks) and not validate_blocks(cached, chunk_blocks):
+                print(f"chunk {idx}/{len(chunk_list)}: using cache {cache_file.name}")
+                translated_all.extend(cached)
+                continue
+            print(f"chunk {idx}/{len(chunk_list)}: cache invalid, retranslating")
+
+        print(f"chunk {idx}/{len(chunk_list)}: translating {len(chunk_blocks)} blocks")
+        translated = translate_chunk(chunk_blocks, glossary, args, idx)
+        write_blocks(cache_file, translated)
+        translated_all.extend(translated)
+        if args.sleep > 0:
+            time.sleep(args.sleep)
+
+    if len(translated_all) != len(blocks):
+        raise SystemExit(f"Final block count mismatch: {len(translated_all)} != {len(blocks)}")
+    final_errors = validate_blocks(translated_all, blocks)
+    if final_errors:
+        raise SystemExit("Final SRT validation failed:\n" + "\n".join(final_errors[:20]))
+
+    write_blocks(out, translated_all)
+    print(f"Wrote {out.resolve()} blocks={len(translated_all)}")
+
+    if args.qa_output:
+        report = qa_report(blocks, translated_all, args.qa_sample_ratio)
+        qa_path = Path(args.qa_output)
+        qa_path.parent.mkdir(parents=True, exist_ok=True)
+        qa_path.write_text(report, encoding="utf-8-sig")
+        print(f"Wrote QA report {qa_path.resolve()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Translate Japanese SRT to Chinese via DeepSeek chat completions.")
+    parser.add_argument("input", help="Input Japanese .srt")
+    parser.add_argument("--output", required=True, help="Output Chinese .srt")
+    parser.add_argument("--api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
+    parser.add_argument("--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
+    parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"))
+    parser.add_argument("--chunk-size", type=int, default=70)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--retry-wait", type=int, default=3)
+    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between successful chunks")
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--qa-output", help="Write a QA report for targeted Codex review")
+    parser.add_argument("--qa-sample-ratio", type=float, default=0.28)
+    parser.add_argument("--force", action="store_true", help="Retranslate cached chunks")
+    parser.add_argument(
+        "--glossary",
+        action="append",
+        default=["hooope_terms.txt", "model/hooope_terms.txt"],
+        help="Glossary file. Can be passed multiple times.",
+    )
+    args = parser.parse_args()
+    translate(args)
+
+
+if __name__ == "__main__":
+    main()

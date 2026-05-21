@@ -1,0 +1,4 @@
+interface:
+  display_name: "HOOOOPE Subtitles"
+  short_description: "Create Chinese burned-in subtitles for HOOOOPE podcast videos."
+  default_prompt: "Use $hooope-subtitles to transcribe a HOOOOPE podcast video, translate and polish Chinese subtitles, then burn them into an MP4."
