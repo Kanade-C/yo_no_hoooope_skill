@@ -1,0 +1,2 @@
+# yo_no_hoooope_skill
+给codex写的羊宫妃那半自动烧录skill
