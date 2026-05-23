@@ -14,6 +14,10 @@ TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}$
 JA_RE = re.compile(r"[\u3040-\u30ff]")
 
 
+class BlockCountMismatch(ValueError):
+    pass
+
+
 def read_blocks(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8-sig")
     return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
@@ -83,21 +87,41 @@ def strip_code_fence(text: str) -> str:
     return text
 
 
+def fix_timestamps(translated_blocks: list[str], source_blocks: list[str]) -> list[str]:
+    if len(translated_blocks) != len(source_blocks):
+        return translated_blocks
+
+    fixed: list[str] = []
+    for translated, source in zip(translated_blocks, source_blocks):
+        translated_lines = translated.splitlines()
+        source_lines = source.splitlines()
+        if len(translated_lines) < 2 or len(source_lines) < 2:
+            fixed.append(translated)
+            continue
+        translated_lines[1] = source_lines[1].strip()
+        fixed.append("\n".join(translated_lines).strip())
+    return fixed
+
+
 def translate_chunk(
     blocks: list[str],
     glossary: str,
     args: argparse.Namespace,
     chunk_index: int,
+    chunk_label: str | None = None,
+    split_cache_dir: Path | None = None,
+    split_cache_prefix: str | None = None,
 ) -> list[str]:
     source = "\n\n".join(blocks)
-    system_prompt = "你是专业的日语到简体中文字幕译者。只输出有效 SRT，不要解释。"
+    label = chunk_label or str(chunk_index)
+    system_prompt = "你是专业的日语到简体中文字幕译者。只输出有效 SRT，不要解释。如果你修改了任何一条时间轴的数字，整个翻译将被视为失败。"
     user_prompt = f"""你正在翻译声优广播节目《羊宫妃那的 HOOOOPE》。
 
 任务：把下面的日语 SRT 分块翻译成自然、流畅的简体中文。
 
 硬性要求：
 1. 保留每一条 SRT 编号不变。
-2. 保留每一条时间轴不变。
+2. 时间轴是神圣不可修改的。每条字幕的时间轴必须原样复制，连一个数字、一个逗号、一个空格都不许改。修改时间轴是最严重的翻译错误。
 3. 只翻译字幕正文，不要改编号、时间轴、空行结构。
 4. 不要总结，不要省略，不要合并字幕段，不要新增字幕段。
 5. 节目名统一为 HOOOOPE。
@@ -138,31 +162,101 @@ SRT 分块：
             translated = read_blocks_from_text(strip_code_fence(content))
 
             if len(translated) != len(blocks):
-                raise ValueError(f"chunk {chunk_index}: block count changed {len(translated)} != {len(blocks)}")
+                raise BlockCountMismatch(f"chunk {label}: block count changed {len(translated)} != {len(blocks)}")
+            translated = fix_timestamps(translated, blocks)
             errors = validate_blocks(translated, blocks)
             if errors:
                 raise ValueError("; ".join(errors[:5]))
             return translated
         except Exception as exc:  # noqa: BLE001
             last_error = exc
+            if isinstance(exc, BlockCountMismatch) and attempt >= 2 and len(blocks) > 1:
+                print(f"chunk {label}: splitting after repeated block count mismatch")
+                return translate_split_chunk(
+                    blocks,
+                    glossary,
+                    args,
+                    chunk_index,
+                    label,
+                    split_cache_dir,
+                    split_cache_prefix,
+                )
             wait = min(args.retry_wait * attempt, 30)
-            print(f"chunk {chunk_index}: attempt {attempt} failed: {exc}")
+            print(f"chunk {label}: attempt {attempt} failed: {exc}")
             if attempt < args.retries:
                 time.sleep(wait)
 
-    raise RuntimeError(f"chunk {chunk_index} failed after {args.retries} attempts: {last_error}")
+    raise RuntimeError(f"chunk {label} failed after {args.retries} attempts: {last_error}")
+
+
+def translate_split_chunk(
+    blocks: list[str],
+    glossary: str,
+    args: argparse.Namespace,
+    chunk_index: int,
+    chunk_label: str,
+    split_cache_dir: Path | None,
+    split_cache_prefix: str | None,
+) -> list[str]:
+    mid = len(blocks) // 2
+    if mid <= 0 or mid >= len(blocks):
+        raise RuntimeError(f"chunk {chunk_label}: cannot split {len(blocks)} blocks")
+
+    results: list[str] = []
+    for suffix, sub_blocks in (("a", blocks[:mid]), ("b", blocks[mid:])):
+        sub_label = f"{chunk_label}{suffix}"
+        cache_file = None
+        if split_cache_dir is not None and split_cache_prefix is not None:
+            cache_file = split_cache_dir / f"{split_cache_prefix}.part{chunk_index:03d}.{sub_label}.zh.srt"
+            if cache_file.exists() and not args.force:
+                cached = read_blocks(cache_file)
+                if len(cached) == len(sub_blocks) and not validate_blocks(cached, sub_blocks):
+                    print(f"chunk {sub_label}: using split cache {cache_file.name}")
+                    results.extend(cached)
+                    continue
+                print(f"chunk {sub_label}: split cache invalid, retranslating")
+
+        translated = translate_chunk(
+            sub_blocks,
+            glossary,
+            args,
+            chunk_index,
+            chunk_label=sub_label,
+            split_cache_dir=split_cache_dir,
+            split_cache_prefix=split_cache_prefix,
+        )
+        if cache_file is not None:
+            write_blocks(cache_file, translated)
+        results.extend(translated)
+
+    return results
 
 
 def read_blocks_from_text(text: str) -> list[str]:
     return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
 
 
-def chunks(items: list[str], size: int) -> list[list[str]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
+def chunks(items: list[str], size: int, overlap: int = 0) -> list[list[str]]:
+    if size <= 0:
+        raise ValueError("chunk size must be greater than 0")
+    if overlap < 0:
+        raise ValueError("overlap must be greater than or equal to 0")
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than chunk size")
+    step = size - overlap
+    return [items[i : i + size] for i in range(0, len(items), step)]
 
 
 def block_number(block: str) -> int:
     return int(block.splitlines()[0].strip())
+
+
+def append_new_blocks(target: list[str], blocks: list[str]) -> None:
+    if not target:
+        target.extend(blocks)
+        return
+    last_number = block_number(target[-1])
+    target.extend(block for block in blocks if block_number(block) > last_number)
 
 
 def block_text(block: str) -> str:
@@ -265,26 +359,34 @@ def translate(args: argparse.Namespace) -> None:
 
     glossary_paths = [Path(p) for p in args.glossary]
     glossary = load_glossary(glossary_paths)
-    chunk_list = chunks(blocks, args.chunk_size)
+    overlap = 10
+    chunk_list = chunks(blocks, args.chunk_size, overlap=overlap)
 
     cache_dir = Path(args.cache_dir) if args.cache_dir else src.parent / "deepseek_chunks" / src.stem
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     translated_all: list[str] = []
     for idx, chunk_blocks in enumerate(chunk_list, start=1):
-        cache_file = cache_dir / f"{src.stem}.part{idx:03d}.zh.srt"
+        cache_file = cache_dir / f"{src.stem}.part{idx:03d}.o{overlap}.zh.srt"
         if cache_file.exists() and not args.force:
             cached = read_blocks(cache_file)
             if len(cached) == len(chunk_blocks) and not validate_blocks(cached, chunk_blocks):
                 print(f"chunk {idx}/{len(chunk_list)}: using cache {cache_file.name}")
-                translated_all.extend(cached)
+                append_new_blocks(translated_all, cached)
                 continue
             print(f"chunk {idx}/{len(chunk_list)}: cache invalid, retranslating")
 
         print(f"chunk {idx}/{len(chunk_list)}: translating {len(chunk_blocks)} blocks")
-        translated = translate_chunk(chunk_blocks, glossary, args, idx)
+        translated = translate_chunk(
+            chunk_blocks,
+            glossary,
+            args,
+            idx,
+            split_cache_dir=cache_dir,
+            split_cache_prefix=f"{src.stem}.o{overlap}",
+        )
         write_blocks(cache_file, translated)
-        translated_all.extend(translated)
+        append_new_blocks(translated_all, translated)
         if args.sleep > 0:
             time.sleep(args.sleep)
 

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import time
@@ -96,6 +97,15 @@ def read_blocks_from_text(text: str) -> list[str]:
 
 def chunks(items: list[str], size: int) -> list[list[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def cached_polish_valid(cache_file: Path, zh_chunk: list[str]) -> list[str] | None:
+    if not cache_file.exists():
+        return None
+    cached = read_blocks(cache_file)
+    if len(cached) == len(zh_chunk) and not validate_blocks(cached, zh_chunk):
+        return cached
+    return None
 
 
 def qa_report(source_blocks: list[str], zh_blocks: list[str], sample_ratio: float) -> str:
@@ -260,23 +270,47 @@ def polish(args: argparse.Namespace) -> None:
     cache_dir = Path(args.cache_dir) if args.cache_dir else source.parent / "deepseek_polish_chunks" / source.stem
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    polished_all: list[str] = []
+    chunk_count = len(ja_chunks)
+    polished_results: list[list[str] | None] = [None] * chunk_count
+    pending: list[tuple[int, list[str], list[str], Path]] = []
     for idx, (ja_chunk, zh_chunk) in enumerate(zip(ja_chunks, zh_chunks), start=1):
         cache_file = cache_dir / f"{source.stem}.part{idx:03d}.polished.srt"
-        if cache_file.exists() and not args.force:
-            cached = read_blocks(cache_file)
-            if len(cached) == len(zh_chunk) and not validate_blocks(cached, zh_chunk):
-                print(f"chunk {idx}/{len(ja_chunks)}: using cache {cache_file.name}")
-                polished_all.extend(cached)
+        if not args.force:
+            cached = cached_polish_valid(cache_file, zh_chunk)
+            if cached is not None:
+                print(f"chunk {idx}/{chunk_count}: using cache {cache_file.name}")
+                polished_results[idx - 1] = cached
                 continue
-            print(f"chunk {idx}/{len(ja_chunks)}: cache invalid, repolishing")
+            if cache_file.exists():
+                print(f"chunk {idx}/{chunk_count}: cache invalid, repolishing")
+        pending.append((idx, ja_chunk, zh_chunk, cache_file))
 
-        print(f"chunk {idx}/{len(ja_chunks)}: polishing {len(zh_chunk)} blocks")
+    def run_polish(task: tuple[int, list[str], list[str], Path]) -> tuple[int, list[str]]:
+        idx, ja_chunk, zh_chunk, cache_file = task
+        print(f"chunk {idx}/{chunk_count}: polishing {len(zh_chunk)} blocks")
         polished = polish_chunk(ja_chunk, zh_chunk, glossary, args, idx)
         write_blocks(cache_file, polished)
-        polished_all.extend(polished)
         if args.sleep > 0:
             time.sleep(args.sleep)
+        return idx, polished
+
+    workers = max(1, args.workers)
+    if pending and workers == 1:
+        for task in pending:
+            idx, polished = run_polish(task)
+            polished_results[idx - 1] = polished
+    elif pending:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {executor.submit(run_polish, task): task[0] for task in pending}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                polished_results[idx - 1] = future.result()[1]
+
+    polished_all: list[str] = []
+    for idx, result in enumerate(polished_results, start=1):
+        if result is None:
+            raise SystemExit(f"Missing polished result for chunk {idx}")
+        polished_all.extend(result)
 
     final_errors = validate_blocks(polished_all, ja_blocks)
     if final_errors:
@@ -310,6 +344,8 @@ def main() -> None:
     parser.add_argument("--qa-output")
     parser.add_argument("--qa-sample-ratio", type=float, default=0.28)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent polish workers")
+    parser.add_argument("--polish-workers", dest="workers", type=int, default=argparse.SUPPRESS, help="Alias for --workers")
     parser.add_argument(
         "--glossary",
         action="append",

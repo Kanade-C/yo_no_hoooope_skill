@@ -24,6 +24,17 @@ TOPIC_HINTS = (
 )
 
 
+def block_seconds(block: str) -> int:
+    lines = block_lines(block)
+    if len(lines) < 2:
+        return 0
+    match = TIME_RE.match(lines[1].strip())
+    if not match:
+        return 0
+    h, m, s = map(int, match.groups())
+    return h * 3600 + m * 60 + s
+
+
 def read_blocks(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8-sig")
     return [block.strip() for block in text.strip().split("\n\n") if block.strip()]
@@ -52,22 +63,52 @@ def block_time_label(block: str) -> str:
 
 def topic_indices(blocks: list[str], max_topics: int) -> list[int]:
     max_topics = max(1, max_topics)
-    indices: list[int] = []
-    seen: set[int] = set()
+    hinted: list[int] = []
     for idx, block in enumerate(blocks):
         text = block_text(block)
         if any(hint in text for hint in TOPIC_HINTS):
-            if idx not in seen:
-                indices.append(idx)
-                seen.add(idx)
-        if len(indices) >= max_topics:
-            break
+            hinted.append(idx)
 
-    if not indices:
-        step = max(1, len(blocks) // max_topics)
-        indices = list(range(0, len(blocks), step))[:max_topics]
+    if not hinted:
+        hinted = list(range(len(blocks)))
 
-    return indices
+    return balanced_indices(hinted, len(blocks), max_topics)
+
+
+def balanced_indices(candidates: list[int], total_blocks: int, max_items: int) -> list[int]:
+    """Pick candidates across the whole subtitle instead of front-loading early hints."""
+    if not candidates or max_items <= 0:
+        return []
+    if len(candidates) <= max_items:
+        return sorted(dict.fromkeys(candidates))
+
+    buckets = min(max_items, max(1, total_blocks))
+    selected: list[int] = []
+    seen: set[int] = set()
+    for bucket in range(buckets):
+        start = bucket * total_blocks / buckets
+        end = (bucket + 1) * total_blocks / buckets
+        in_bucket = [idx for idx in candidates if start <= idx < end]
+        if not in_bucket:
+            continue
+        pick = in_bucket[0]
+        selected.append(pick)
+        seen.add(pick)
+
+    if len(selected) < max_items:
+        target_positions = [
+            round(i * (len(candidates) - 1) / max(1, max_items - 1))
+            for i in range(max_items)
+        ]
+        for pos in target_positions:
+            pick = candidates[pos]
+            if pick not in seen:
+                selected.append(pick)
+                seen.add(pick)
+            if len(selected) >= max_items:
+                break
+
+    return sorted(selected[:max_items])
 
 
 def compact_srt_for_note(blocks: list[str], topic_idxs: list[int], max_blocks: int, window: int) -> str:
@@ -89,7 +130,8 @@ def compact_srt_for_note(blocks: list[str], topic_idxs: list[int], max_blocks: i
             break
 
     if len(selected_indices) < max_blocks:
-        step = max(1, len(blocks) // (max_blocks - len(selected_indices)))
+        remaining = max_blocks - len(selected_indices)
+        step = max(1, len(blocks) // remaining)
         selected_indices.update(range(0, len(blocks), step))
 
     selected = [blocks[idx] for idx in sorted(selected_indices)[:max_blocks]]
@@ -143,9 +185,13 @@ def write_note(args: argparse.Namespace) -> None:
 2. 按节目来信和话题分段，用『话题标题』作为小标题。
 3. 每段加入大致时间，例如 01:27左右，时间来自话题开始处字幕。
 4. 简要说明来信讲了什么、羊宫妃那怎么回应、有趣点在哪里。
-5. 可以参考“候选话题时间点”，但要根据 SRT 内容自行合并相近话题。
-6. 结尾可保留 #羊宫妃那。
-7. 输出纯文本，不要 Markdown 代码块。
+5. 覆盖全片内容，不要把后半段合并成“后半场/集锦”一笔带过；前中后段应有大致均衡的篇幅。
+6. 如果节目包含多个环节（如 Battle、Step Up、After Talk、通知、来信主题），每个主要环节都应单独成段或明确并入相邻段。
+7. 可以参考“候选话题时间点”，但要根据 SRT 内容自行合并相近话题。
+8. 正片约 50-60 分钟时通常写 10-14 个话题段；短会员视频按实际内容写 4-7 个话题段。
+9. 避免只详写前 20 分钟；任何连续 15 分钟以上的节目内容都不应完全缺席。
+10. 结尾可保留 #羊宫妃那。
+11. 输出纯文本，不要 Markdown 代码块。
 
 项目术语表：
 {glossary or "(none)"}
