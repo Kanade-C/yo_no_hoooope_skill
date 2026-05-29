@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -12,6 +14,8 @@ import requests
 
 TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}$")
 JA_RE = re.compile(r"[\u3040-\u30ff]")
+TRANSLATION_PROMPT_VERSION = "2026-05-27.strict-srt.v2"
+TRANSLATION_CACHE_SCHEMA = "core-plus-dependencies-v1"
 
 
 class BlockCountMismatch(ValueError):
@@ -26,6 +30,49 @@ def read_blocks(path: Path) -> list[str]:
 def write_blocks(path: Path, blocks: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n\n".join(blocks).strip() + "\n", encoding="utf-8-sig")
+
+
+def blocks_hash(blocks: list[str]) -> str:
+    payload = "\n\n".join(block.strip() for block in blocks).strip()
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def hash_sidecar(path: Path) -> Path:
+    return path.with_name(path.name + ".source.sha256")
+
+
+def dependency_hash_sidecar(path: Path) -> Path:
+    return path.with_name(path.name + ".dependency.sha256")
+
+
+def write_source_hash(path: Path, source_hash: str) -> None:
+    hash_sidecar(path).write_text(source_hash + "\n", encoding="ascii")
+
+
+def write_dependency_hash(path: Path, dependency_hash: str) -> None:
+    dependency_hash_sidecar(path).write_text(dependency_hash + "\n", encoding="ascii")
+
+
+def source_hash_matches(path: Path, source_hash: str) -> bool:
+    sidecar = hash_sidecar(path)
+    return sidecar.exists() and sidecar.read_text(encoding="ascii").strip() == source_hash
+
+
+def dependency_hash_matches(path: Path, dependency_hash: str) -> bool:
+    sidecar = dependency_hash_sidecar(path)
+    return sidecar.exists() and sidecar.read_text(encoding="ascii").strip() == dependency_hash
+
+
+def translation_dependency_hash(glossary: str, args: argparse.Namespace) -> str:
+    payload = {
+        "schema": TRANSLATION_CACHE_SCHEMA,
+        "prompt_version": TRANSLATION_PROMPT_VERSION,
+        "glossary": glossary,
+        "model": args.model,
+        "temperature": args.temperature,
+        "alignment_mode": args.alignment_mode,
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def block_header(block: str) -> tuple[str, str]:
@@ -57,13 +104,18 @@ def validate_blocks(blocks: list[str], expected_blocks: list[str] | None = None)
     return errors
 
 
-def bundled_reference_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "references" / "terms-and-notes.md"
+def bundled_reference_paths() -> list[Path]:
+    refs = Path(__file__).resolve().parents[1] / "references"
+    return [
+        refs / "terms-glossary.md",
+        refs / "deepseek-prompts.md",
+        refs / "review-policy.md",
+    ]
 
 
 def load_glossary(paths: list[Path]) -> str:
     parts: list[str] = []
-    all_paths = [bundled_reference_path(), *paths]
+    all_paths = [*bundled_reference_paths(), *paths]
     seen: set[Path] = set()
     for path in all_paths:
         path = path.resolve()
@@ -111,10 +163,12 @@ def translate_chunk(
     chunk_label: str | None = None,
     split_cache_dir: Path | None = None,
     split_cache_prefix: str | None = None,
+    context_prefix: list[str] | None = None,
 ) -> list[str]:
     source = "\n\n".join(blocks)
+    context_text = "\n\n".join(context_prefix or [])
     label = chunk_label or str(chunk_index)
-    system_prompt = "你是专业的日语到简体中文字幕译者。只输出有效 SRT，不要解释。如果你修改了任何一条时间轴的数字，整个翻译将被视为失败。"
+    system_prompt = f"你是专业的日语到简体中文字幕译者。只输出有效 SRT，不要解释。如果你修改了任何一条时间轴的数字，整个翻译将被视为失败。PromptVersion={TRANSLATION_PROMPT_VERSION}"
     user_prompt = f"""你正在翻译声优广播节目《羊宫妃那的 HOOOOPE》。
 
 任务：把下面的日语 SRT 分块翻译成自然、流畅的简体中文。
@@ -127,14 +181,20 @@ def translate_chunk(
 5. 节目名统一为 HOOOOPE。
 6. 主持人统一为羊宫妃那。
 7. 听众来信要像中文投稿，主持人回应要像自然口播。
-8. 不确定的节目固定词、广播名、昵称，优先保留原名或音译，不要乱译。
-9. 日语接龙、双关、玩笑要让中文观众能理解，但不要写成长解释。
-10. 输出只能是完整 SRT，不要 Markdown，不要代码块，不要解释。
+8. 听众昵称如果是纯假名或未确认广播名，优先罗马字化或音译；不要把假名残留到公开视频字幕里，除非原文形式对笑点有意义。
+9. 不确定的节目固定词、作品名、品牌名、角色名，优先保留原名或按术语表处理，不要乱译。
+10. 日语接龙、双关、玩笑要让中文观众能理解，但不要写成长解释。
+11. ASR 可能把同音词、近音词或语义相邻词写错。遇到画画、插画、投稿、节分、画鬼、昵称、作品名等上下文时，不要只看当前一句，也不要机械套用单条例子；结合只读上下文和本分块前后内容判断真实话题对象，再自然翻译。
+12. 输出只能是完整 SRT，不要 Markdown，不要代码块，不要解释。
+13. 如果提供了“只读上下文”，它只用于理解语境；不要输出上下文里的任何字幕。
 
 项目术语表：
 {glossary or "(none)"}
 
-SRT 分块：
+只读上下文（不要输出）：
+{context_text or "(none)"}
+
+需要翻译并输出的 SRT 分块：
 {source}
 """
     payload = {
@@ -208,9 +268,15 @@ def translate_split_chunk(
         cache_file = None
         if split_cache_dir is not None and split_cache_prefix is not None:
             cache_file = split_cache_dir / f"{split_cache_prefix}.part{chunk_index:03d}.{sub_label}.zh.srt"
+            sub_hash = blocks_hash(sub_blocks)
             if cache_file.exists() and not args.force:
                 cached = read_blocks(cache_file)
-                if len(cached) == len(sub_blocks) and not validate_blocks(cached, sub_blocks):
+                if (
+                    len(cached) == len(sub_blocks)
+                    and not validate_blocks(cached, sub_blocks)
+                    and source_hash_matches(cache_file, sub_hash)
+                    and dependency_hash_matches(cache_file, translation_dependency_hash(glossary, args))
+                ):
                     print(f"chunk {sub_label}: using split cache {cache_file.name}")
                     results.extend(cached)
                     continue
@@ -227,6 +293,8 @@ def translate_split_chunk(
         )
         if cache_file is not None:
             write_blocks(cache_file, translated)
+            write_source_hash(cache_file, sub_hash)
+            write_dependency_hash(cache_file, translation_dependency_hash(glossary, args))
         results.extend(translated)
 
     return results
@@ -257,6 +325,18 @@ def append_new_blocks(target: list[str], blocks: list[str]) -> None:
         return
     last_number = block_number(target[-1])
     target.extend(block for block in blocks if block_number(block) > last_number)
+
+
+def context_core_chunks(items: list[str], size: int, context_size: int) -> list[tuple[int, list[str], list[str]]]:
+    if size <= 0:
+        raise ValueError("chunk size must be greater than 0")
+    tasks: list[tuple[int, list[str], list[str]]] = []
+    for start in range(0, len(items), size):
+        context_start = max(0, start - context_size)
+        context = items[context_start:start]
+        core = items[start : start + size]
+        tasks.append((len(tasks) + 1, context, core))
+    return tasks
 
 
 def block_text(block: str) -> str:
@@ -359,18 +439,97 @@ def translate(args: argparse.Namespace) -> None:
 
     glossary_paths = [Path(p) for p in args.glossary]
     glossary = load_glossary(glossary_paths)
+    dep_hash = translation_dependency_hash(glossary, args)
     overlap = 10
-    chunk_list = chunks(blocks, args.chunk_size, overlap=overlap)
 
     cache_dir = Path(args.cache_dir) if args.cache_dir else src.parent / "deepseek_chunks" / src.stem
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.alignment_mode != "strict":
+        raise SystemExit("soft-experimental alignment is reserved but not implemented in the production translator yet")
+
+    if args.workers > 1:
+        translated_results: list[list[str] | None] = [None] * len(context_core_chunks(blocks, args.chunk_size, args.context_blocks))
+        pending: list[tuple[int, list[str], list[str], Path, str]] = []
+        chunk_tasks = context_core_chunks(blocks, args.chunk_size, args.context_blocks)
+        for idx, context_prefix, core_blocks in chunk_tasks:
+            cache_file = cache_dir / f"{src.stem}.part{idx:03d}.ctx{args.context_blocks}.core.zh.srt"
+            core_hash = blocks_hash(core_blocks)
+            if cache_file.exists() and not args.force:
+                cached = read_blocks(cache_file)
+                if (
+                    len(cached) == len(core_blocks)
+                    and not validate_blocks(cached, core_blocks)
+                    and source_hash_matches(cache_file, core_hash)
+                    and dependency_hash_matches(cache_file, dep_hash)
+                ):
+                    print(f"chunk {idx}/{len(chunk_tasks)}: using core cache {cache_file.name}")
+                    translated_results[idx - 1] = cached
+                    continue
+                print(f"chunk {idx}/{len(chunk_tasks)}: core cache invalid, retranslating")
+            pending.append((idx, context_prefix, core_blocks, cache_file, core_hash))
+
+        def run_task(task: tuple[int, list[str], list[str], Path, str]) -> tuple[int, list[str]]:
+            idx, context_prefix, core_blocks, cache_file, core_hash = task
+            print(f"chunk {idx}/{len(chunk_tasks)}: translating core={len(core_blocks)} context={len(context_prefix)}")
+            translated = translate_chunk(
+                core_blocks,
+                glossary,
+                args,
+                idx,
+                split_cache_dir=cache_dir,
+                split_cache_prefix=f"{src.stem}.ctx{args.context_blocks}.core",
+                context_prefix=context_prefix,
+            )
+            write_blocks(cache_file, translated)
+            write_source_hash(cache_file, core_hash)
+            write_dependency_hash(cache_file, dep_hash)
+            if args.sleep > 0:
+                time.sleep(args.sleep)
+            return idx, translated
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+            future_to_idx = {executor.submit(run_task, task): task[0] for task in pending}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx, translated = future.result()
+                translated_results[idx - 1] = translated
+
+        translated_all = []
+        for idx, result in enumerate(translated_results, start=1):
+            if result is None:
+                raise SystemExit(f"Missing translated result for chunk {idx}")
+            translated_all.extend(result)
+
+        if len(translated_all) != len(blocks):
+            raise SystemExit(f"Final block count mismatch: {len(translated_all)} != {len(blocks)}")
+        final_errors = validate_blocks(translated_all, blocks)
+        if final_errors:
+            raise SystemExit("Final SRT validation failed:\n" + "\n".join(final_errors[:20]))
+        write_blocks(out, translated_all)
+        write_source_hash(out, blocks_hash(blocks))
+        write_dependency_hash(out, dep_hash)
+        print(f"Wrote {out.resolve()} blocks={len(translated_all)} workers={args.workers}")
+        if args.qa_output:
+            report = qa_report(blocks, translated_all, args.qa_sample_ratio)
+            qa_path = Path(args.qa_output)
+            qa_path.parent.mkdir(parents=True, exist_ok=True)
+            qa_path.write_text(report, encoding="utf-8-sig")
+            print(f"Wrote QA report {qa_path.resolve()}")
+        return
+
+    chunk_list = chunks(blocks, args.chunk_size, overlap=overlap)
     translated_all: list[str] = []
     for idx, chunk_blocks in enumerate(chunk_list, start=1):
         cache_file = cache_dir / f"{src.stem}.part{idx:03d}.o{overlap}.zh.srt"
+        chunk_hash = blocks_hash(chunk_blocks)
         if cache_file.exists() and not args.force:
             cached = read_blocks(cache_file)
-            if len(cached) == len(chunk_blocks) and not validate_blocks(cached, chunk_blocks):
+            if (
+                len(cached) == len(chunk_blocks)
+                and not validate_blocks(cached, chunk_blocks)
+                and source_hash_matches(cache_file, chunk_hash)
+                and dependency_hash_matches(cache_file, dep_hash)
+            ):
                 print(f"chunk {idx}/{len(chunk_list)}: using cache {cache_file.name}")
                 append_new_blocks(translated_all, cached)
                 continue
@@ -386,6 +545,8 @@ def translate(args: argparse.Namespace) -> None:
             split_cache_prefix=f"{src.stem}.o{overlap}",
         )
         write_blocks(cache_file, translated)
+        write_source_hash(cache_file, chunk_hash)
+        write_dependency_hash(cache_file, dep_hash)
         append_new_blocks(translated_all, translated)
         if args.sleep > 0:
             time.sleep(args.sleep)
@@ -397,6 +558,8 @@ def translate(args: argparse.Namespace) -> None:
         raise SystemExit("Final SRT validation failed:\n" + "\n".join(final_errors[:20]))
 
     write_blocks(out, translated_all)
+    write_source_hash(out, blocks_hash(blocks))
+    write_dependency_hash(out, dep_hash)
     print(f"Wrote {out.resolve()} blocks={len(translated_all)}")
 
     if args.qa_output:
@@ -424,10 +587,13 @@ def main() -> None:
     parser.add_argument("--qa-output", help="Write a QA report for targeted Codex review")
     parser.add_argument("--qa-sample-ratio", type=float, default=0.28)
     parser.add_argument("--force", action="store_true", help="Retranslate cached chunks")
+    parser.add_argument("--workers", type=int, default=1, help="Concurrent translation workers; 1 preserves the legacy serial overlap path")
+    parser.add_argument("--context-blocks", type=int, default=20, help="Read-only context blocks for concurrent translation")
+    parser.add_argument("--alignment-mode", choices=["strict", "soft-experimental"], default="strict")
     parser.add_argument(
         "--glossary",
         action="append",
-        default=["hooope_terms.txt", "model/hooope_terms.txt"],
+        default=["hoooope_terms.txt", "model/hoooope_terms.txt", "hooope_terms.txt", "model/hooope_terms.txt"],
         help="Glossary file. Can be passed multiple times.",
     )
     args = parser.parse_args()

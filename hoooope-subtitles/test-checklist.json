@@ -1,0 +1,89 @@
+{
+  "schema": "auto-skill-forge-checklist-v1",
+  "skill": "hoooope-subtitles",
+  "eval_mode": "dry_run_or_judge",
+  "checklist": [
+    {
+      "id": "scope_guard",
+      "question": "Does the response preserve the user's requested scope, especially summary-only without MP4 organization, ASR, burn, cleanup, or video edits?"
+    },
+    {
+      "id": "reference_loading",
+      "question": "Does the response load only the relevant reference files for the requested stage and include the split glossary/prompt/note/review references when needed?"
+    },
+    {
+      "id": "qa_gates",
+      "question": "Does the response run or require the correct local ASR enhancement and QA gates for the stage, including Qwen risk-segment comparison in default prepare-review, and rerun checks after high-risk fixes?"
+    },
+    {
+      "id": "artifact_ownership",
+      "question": "Does Codex consume QA reports, candidate files, baseline reports, and screenshot contact sheets as internal workbench inputs instead of assigning them to the user?"
+    },
+    {
+      "id": "stop_points",
+      "question": "Does the response stop at the required proofread, visual QA, or cleanup-confirmation checkpoint and avoid irreversible cleanup before confirmation?"
+    }
+  ],
+  "test_inputs": [
+    {
+      "id": "full_production_root_mp4",
+      "request": "这里有一个 HOOOOPE episode 文件夹，根目录只有 hope_25_0715.mp4。请做完整中文字幕、烧录视频、summary 和清理。",
+      "expected_boundaries": ["reference_loading", "qa_gates", "artifact_ownership", "stop_points"]
+    },
+    {
+      "id": "summary_only_existing_srts",
+      "request": "不用烧录啊，我只让你根据现有中文字幕写一个总 summary。",
+      "expected_boundaries": ["scope_guard", "reference_loading"]
+    },
+    {
+      "id": "resume_after_deepseek",
+      "request": "这个文件夹已经有 .orig.srt、.deepseek.raw.srt 和 .deepseek.polished.srt，继续后面的公开发布流程。",
+      "expected_boundaries": ["reference_loading", "qa_gates", "stop_points"]
+    },
+    {
+      "id": "deepseek_chunk_failure",
+      "request": "DeepSeek 翻译中途 API reset 了，已有部分 chunk/cache，继续不要重头浪费。",
+      "expected_boundaries": ["reference_loading", "artifact_ownership"]
+    },
+    {
+      "id": "qwen_runtime_missing",
+      "request": "默认高质量流程里 qwen_asr 环境还没装好，但模型文件在 model/qwen-3-asr-1.7b，继续不要破坏 Whisper 主流程。",
+      "expected_boundaries": ["scope_guard", "qa_gates", "artifact_ownership"]
+    },
+    {
+      "id": "qa_hits_fixed_terms",
+      "request": "terms-audit 报了 AGVIOT、HOPE 和 Supported by 村上真夏，处理到能公开发布。",
+      "expected_boundaries": ["qa_gates", "artifact_ownership"]
+    },
+    {
+      "id": "screenshot_fail_reburn",
+      "request": "截图检查发现字幕压到脸和产品标签了，修完重新烧录并确认。",
+      "expected_boundaries": ["qa_gates", "artifact_ownership", "stop_points"]
+    },
+    {
+      "id": "cleanup_without_confirmation",
+      "request": "直接 cleanup 这个 episode 文件夹，截图还没看。",
+      "expected_boundaries": ["scope_guard", "stop_points"]
+    },
+    {
+      "id": "utf8_chinese_path",
+      "request": "处理 D:\\羊宫妃那\\HOOOOPE 107，里面有中文路径和 UTF-8 SRT，不要被 PowerShell 显示乱码误导。",
+      "expected_boundaries": ["reference_loading", "qa_gates"]
+    },
+    {
+      "id": "public_release_strict_review",
+      "request": "这期要公开发布，不能降低质量，最终检查你自己负责。",
+      "expected_boundaries": ["qa_gates", "artifact_ownership", "stop_points"]
+    },
+    {
+      "id": "explicit_reduced_review",
+      "request": "这次只做快速版，允许为了省时间降低 Codex 最终审核比例。",
+      "expected_boundaries": ["scope_guard", "reference_loading", "qa_gates"]
+    }
+  ],
+  "scoring": {
+    "pass_rate": "yes_answers / (checklist_count * test_input_count)",
+    "effectiveness_score": "pass_rate * 25",
+    "improvement_rule": "new_total_score must be strictly greater than baseline_total_score"
+  }
+}

@@ -148,13 +148,19 @@ def topic_candidates(blocks: list[str], topic_idxs: list[int]) -> str:
     return "\n".join(candidates)
 
 
-def bundled_reference_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "references" / "terms-and-notes.md"
+def bundled_reference_paths() -> list[Path]:
+    refs = Path(__file__).resolve().parents[1] / "references"
+    return [
+        refs / "terms-glossary.md",
+        refs / "note-style.md",
+        refs / "deepseek-prompts.md",
+        refs / "review-policy.md",
+    ]
 
 
 def load_glossary(paths: list[Path]) -> str:
     parts: list[str] = []
-    all_paths = [bundled_reference_path(), *paths]
+    all_paths = [*bundled_reference_paths(), *paths]
     seen: set[Path] = set()
     for path in all_paths:
         path = path.resolve()
@@ -188,10 +194,11 @@ def write_note(args: argparse.Namespace) -> None:
 5. 覆盖全片内容，不要把后半段合并成“后半场/集锦”一笔带过；前中后段应有大致均衡的篇幅。
 6. 如果节目包含多个环节（如 Battle、Step Up、After Talk、通知、来信主题），每个主要环节都应单独成段或明确并入相邻段。
 7. 可以参考“候选话题时间点”，但要根据 SRT 内容自行合并相近话题。
-8. 正片约 50-60 分钟时通常写 10-14 个话题段；短会员视频按实际内容写 4-7 个话题段。
-9. 避免只详写前 20 分钟；任何连续 15 分钟以上的节目内容都不应完全缺席。
-10. 结尾可保留 #羊宫妃那。
-11. 输出纯文本，不要 Markdown 代码块。
+8. 初稿可以略宽一些，但文风必须是观看笔记：具体、方便回看，少用“太可爱了”“神企划”“超级好笑”等泛泛夸赞。
+9. 正片约 50-60 分钟时通常写 10-14 个候选话题段；短会员视频按实际内容写 4-7 个候选话题段。Codex 后续会压缩成最终 episode note。
+10. 避免只详写前 20 分钟；任何连续 15 分钟以上的节目内容都不应完全缺席。
+11. 结尾可保留 #羊宫妃那。
+12. 输出纯文本，不要 Markdown 代码块。
 
 项目术语表：
 {glossary or "(none)"}
@@ -248,7 +255,11 @@ def main() -> None:
     parser.add_argument("--max-blocks", type=int, default=260)
     parser.add_argument("--max-topics", type=int, default=24)
     parser.add_argument("--topic-window", type=int, default=10)
-    parser.add_argument("--glossary", action="append", default=["hooope_terms.txt", "model/hooope_terms.txt"])
+    parser.add_argument(
+        "--glossary",
+        action="append",
+        default=["hoooope_terms.txt", "model/hoooope_terms.txt", "hooope_terms.txt", "model/hooope_terms.txt"],
+    )
     args = parser.parse_args()
     write_note(args)
 

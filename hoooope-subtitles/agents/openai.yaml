@@ -1,4 +1,5 @@
 interface:
   display_name: "HOOOOPE Subtitles"
-  short_description: "Create Chinese burned-in subtitles for HOOOOPE podcast videos."
-  default_prompt: "Use $hooope-subtitles to transcribe a HOOOOPE podcast video, translate and polish Chinese subtitles, then burn them into an MP4."
+  short_description: "Run the full HOOOOPE subtitle pipeline with QA, notes, burn-in, and cleanup."
+  default_prompt: "Use $hoooope-subtitles on an episode folder or source MP4s to produce publish-ready Chinese burned-in videos, final SRTs, and a concise episode note. Codex handles transcription, DeepSeek translation/polish, internal QA, reburns, screenshot checks, and cleanup."
+

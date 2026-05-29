@@ -1,0 +1,16 @@
+# Python bytecode / caches (regenerable; never commit)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Episode work artifacts (produced at runtime, not part of the skill)
+*.orig.raw.srt
+*.orig.srt
+*.orig.audit.txt
+*.deepseek.raw.srt
+*.deepseek.polished.srt
+*.qa.txt
+*.review.todo.txt
+*.summary.txt
+*.sha256
+.hoooope_run_manifest.json

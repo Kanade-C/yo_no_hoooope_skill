@@ -1,114 +1,169 @@
 # yo_no_hoooope_skill
 
-给 Codex 使用的《羊宫妃那的 HOOOOPE》半自动字幕烧录 skill。
+Codex skill for producing publish-ready Chinese subtitles and burned videos for *Yomiya Hina no HOOOOPE*.
 
-这是一个基于 DeepSeek + Codex 双模型协作的声优广播字幕工作流，覆盖日语转写、中文字幕翻译、字幕润色、质量审计、视频烧录、截图验收和中文观看笔记生成。它的目标不是“一条 prompt 跑到底”，而是把机器翻译、自动检查和 Codex 最终判断拆成稳定可复用的生产流程。
+This repository packages the `hoooope-subtitles` skill: a conservative production workflow for Japanese ASR, Chinese subtitle translation, final QA, MP4 burn-in validation, screenshot review, cleanup, and concise Chinese viewing notes. It is built for HOOOOPE episodes, not as a generic subtitle toy.
 
-## 主要功能
+## What It Does
 
-- 本地 faster-whisper 转写日语语音，生成 `.orig.srt`。
-- DeepSeek V4-Pro 完整翻译日语 SRT。
-- DeepSeek V4-Pro 二次自我润色，并输出 QA 检查文件。
-- Codex 对高风险段落、抽样段落、固定术语、人名和机翻腔做最终审计。
-- 自动校验 SRT 编号、时间轴、行长、术语和疑似专有名词。
-- 使用 ffmpeg 烧录中文字幕，并通过 ffprobe 做时长熔断，避免音画不同步文件覆盖源视频。
-- 生成截图 contact sheet，检查字幕位置、遮挡、对比度和中日英混排行宽。
-- 根据最终中文字幕生成中文观看笔记，并合并为单集摘要。
-- 清理中间产物，只保留最终视频、原文 SRT、中文字幕 SRT 和单集笔记。
+- Creates Japanese source SRTs from episode MP4s.
+- Uses Whisper large-v3-turbo with local Silero VAD as the default timing-stable ASR backbone.
+- Runs Qwen3-ASR-1.7B on high-risk source segments as a sidecar comparison report.
+- Translates and self-polishes 100% of subtitles with DeepSeek V4-Pro.
+- Keeps Codex responsible for final full-pass review, fixed-term correction, and only-changed-block subtitle edits.
+- Runs local release gates for structure, line length, public subtitle readability, fixed terms, proper nouns, and review TODOs.
+- Burns final Chinese SRTs into MP4s with duration validation.
+- Generates screenshot contact sheets for visual subtitle QA before cleanup.
+- Writes a concise episode-level Chinese viewing note from final subtitles.
 
-## 仓库结构
+## Why This Workflow
+
+HOOOOPE subtitles have recurring production risks: member names, program corners, listener nicknames, brand names, jokes, self-corrections, long pauses, BGM-heavy segments, and Japanese ASR homophones. The skill treats those as production constraints:
+
+- Whisper owns the timing scaffold.
+- Qwen is review evidence, not an automatic replacement for Whisper timing.
+- DeepSeek handles full translation and self-polish.
+- Codex consumes QA artifacts and makes the final judgment.
+- Cleanup is blocked until burned video, screenshot QA, and summary output are confirmed.
+
+## Repository Layout
 
 ```text
 .
 ├─ README.md
 └─ hoooope-subtitles/
    ├─ SKILL.md
+   ├─ test-checklist.json
    ├─ agents/
    │  └─ openai.yaml
    ├─ references/
-   │  └─ terms-and-notes.md
+   │  ├─ workflow.md
+   │  ├─ translation-and-asr.md
+   │  ├─ review-and-qa.md
+   │  ├─ summary-and-tone.md
+   │  ├─ terms-glossary.md
+   │  ├─ deepseek-prompts.md
+   │  ├─ note-style.md
+   │  └─ review-policy.md
    └─ scripts/
-      ├─ hooope_subtitles.py
+      ├─ hoooope_subtitles.py
       ├─ deepseek_translate_srt.py
       ├─ deepseek_polish_srt.py
-      └─ deepseek_note_srt.py
+      ├─ deepseek_note_srt.py
+      └─ hooope_lib/
 ```
 
-## 输入约定
+## Requirements
 
-推荐使用日期型文件名，便于区分 regular 和 member 视频。
+- Python 3.11+
+- `ffmpeg` and `ffprobe`
+- `stable-whisper`, `faster-whisper`, `onnxruntime`, `torch`
+- DeepSeek API key in `DEEPSEEK_API_KEY`
+- Local ASR assets, usually under the workspace `model/` directory:
+  - `model/large_v3_turbo`
+  - `model/qwen-3-asr-1.7b`
+  - `model/silero_vad.onnx`
+  - `model/hoooope_terms.txt`
+- Optional for Qwen comparison: `qwen-asr`
 
-```text
-project/
-├─ model/
-├─ hooope_terms.txt
-└─ hope_25_0513/
-   ├─ hope_25_0513.mp4
-   └─ hope_25_0513_member.mp4
-```
-
-旧格式 `hoooope_<episode>.mp4` 和 `hoooope_<episode>_member*.mp4` 仍然兼容。
-
-## 输出示例
-
-处理完成后，每个视频会被放入自己的工作目录，最终只保留核心文件。
-
-```text
-hope_25_0513/
-├─ hope_25_0513.summary.txt
-├─ hope_25_0513/
-│  ├─ hope_25_0513.mp4
-│  ├─ hope_25_0513.orig.srt
-│  └─ hope_25_0513.srt
-└─ hope_25_0513_member/
-   ├─ hope_25_0513_member.mp4
-   ├─ hope_25_0513_member.orig.srt
-   └─ hope_25_0513_member.srt
-```
-
-## 环境需求
-
-- Python 3
-- `ffmpeg` / `ffprobe`
-- 本地 faster-whisper 模型目录，默认使用 `model/`
-- DeepSeek V4-Pro API，用于翻译、润色和摘要生成
-- 可选项目术语表：`hooope_terms.txt`
-
-## 使用方式
-
-在 Codex 中调用 skill：
-
-```text
-Use $hoooope-subtitles to process ./hope_25_0513
-```
-
-主脚本也可以直接查看命令：
+Install Qwen support when you want the default high-quality ASR comparison to run instead of writing a skipped sidecar:
 
 ```powershell
-python .\hoooope-subtitles\scripts\hooope_subtitles.py --help
+python -m pip install -U qwen-asr
 ```
 
-常用命令包括：
+## Install As A Codex Skill
 
-- `transcribe`
-- `validate`
-- `lint-final`
-- `terms-audit`
-- `review-todo`
-- `proper-noun-candidates`
-- `split-srt`
-- `merge-srt`
-- `burn`
-- `screenshot-check`
-- `cleanup`
-- `combine-summaries`
+Copy or clone `hoooope-subtitles/` into your Codex skills directory:
 
-## 字幕风格
+```powershell
+Copy-Item -Recurse -Force .\hoooope-subtitles C:\Users\CHENG\.codex\skills\hoooope-subtitles
+```
 
-最终字幕以“自然、好读、对中文观众成立”为优先目标，而不是机械贴合日语语序。
+Validate the installed skill:
 
-工作流会保留羊宫妃那说话中的犹豫、吐槽、自我修正和轻微口癖，但会压掉没有信息量的填充语、机器翻译腔、过长字幕和不自然直译。固定术语、人名、栏目名和常见 ASR 误识别由 `references/terms-and-notes.md` 维护，项目级 `hooope_terms.txt` 可以进一步补充或覆盖。
+```powershell
+python C:\Users\CHENG\.codex\skills\.system\skill-creator\scripts\quick_validate.py C:\Users\CHENG\.codex\skills\hoooope-subtitles
+python C:\Users\CHENG\.codex\skills\hoooope-subtitles\scripts\hoooope_subtitles.py self-test
+```
 
-## 设计取向
+## Typical Usage
 
-这个项目比较保守，也比较偏生产导向。DeepSeek 负责完整覆盖和二次润色，Codex 负责最终判断和人工式质检；这样速度不一定最快，但更适合需要稳定输出、术语一致、可发布视频字幕的场景。
+In Codex, ask for full production on an episode folder:
+
+```text
+Use $hoooope-subtitles to process D:\yo_no_hoooope\hope_25_0715
+```
+
+The staged helper can also be run directly:
+
+```powershell
+python C:\Users\CHENG\.codex\skills\hoooope-subtitles\scripts\hoooope_subtitles.py pipeline D:\yo_no_hoooope\hope_25_0715
+python C:\Users\CHENG\.codex\skills\hoooope-subtitles\scripts\hoooope_subtitles.py pipeline D:\yo_no_hoooope\hope_25_0715 --stage post-review
+python C:\Users\CHENG\.codex\skills\hoooope-subtitles\scripts\hoooope_subtitles.py pipeline D:\yo_no_hoooope\hope_25_0715 --stage burn-cleanup
+```
+
+Useful ASR switches:
+
+```powershell
+# Default: Whisper backbone + Qwen risk-segment sidecar
+--asr-enhancement qwen-risk
+
+# Require Qwen comparison and fail if qwen_asr is unavailable
+--asr-enhancement qwen-risk-required
+
+# Whisper-only path
+--asr-enhancement off
+```
+
+For summary-only requests, the skill must not touch videos:
+
+```powershell
+python C:\Users\CHENG\.codex\skills\hoooope-subtitles\scripts\hoooope_subtitles.py pipeline D:\yo_no_hoooope\hope_25_0715 --stage post-review --summary-only
+```
+
+## Output Shape
+
+Each root MP4 is organized into a same-stem work folder. The episode root keeps the combined summary:
+
+```text
+hope_25_0715/
+├─ hope_25_0715.summary.txt
+├─ hope_25_0715/
+│  ├─ hope_25_0715.mp4
+│  ├─ hope_25_0715.orig.raw.srt
+│  ├─ hope_25_0715.orig.srt
+│  ├─ hope_25_0715.asr.compare.txt
+│  └─ hope_25_0715.srt
+└─ hope_25_0715_member/
+   ├─ hope_25_0715_member.mp4
+   ├─ hope_25_0715_member.orig.raw.srt
+   ├─ hope_25_0715_member.orig.srt
+   ├─ hope_25_0715_member.asr.compare.txt
+   └─ hope_25_0715_member.srt
+```
+
+Intermediate DeepSeek files, QA reports, chunk caches, screenshot-check files, and per-video summaries are workbench artifacts. Codex consumes them before final reporting; they are not user homework.
+
+## Quality Policy
+
+Default production is `public-release strict`:
+
+- 100% DeepSeek initial translation.
+- 100% DeepSeek self-polish.
+- 100% Codex source/final subtitle proofread in manageable chunks.
+- Only-corrections editing for final SRTs.
+- Mandatory public-release gates before burn.
+- Screenshot contact sheet inspection before cleanup.
+
+Reduced review is only for explicit speed/cost tradeoffs.
+
+## Development Checks
+
+```powershell
+python -m py_compile .\hoooope-subtitles\scripts\hoooope_subtitles.py
+python .\hoooope-subtitles\scripts\hoooope_subtitles.py self-test
+python .\hoooope-subtitles\scripts\hoooope_subtitles.py pipeline --help
+```
+
+The skill-level checklist lives in `hoooope-subtitles/test-checklist.json`.
