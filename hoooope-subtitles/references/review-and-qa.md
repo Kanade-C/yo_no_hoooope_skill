@@ -16,6 +16,8 @@ Use only-corrections editing:
 
 Prefer natural Chinese subtitle rhythm over literal Japanese order, but do not add unsupported softeners, cuteness, jokes, facts, or explanations. Keep hesitation, teasing, self-correction, laughter, and staff interaction when they carry meaning or humor.
 
+After the full proofread is complete, run `python <skill_dir>\scripts\hoooope_subtitles.py mark-proofread <episode>` to write the hash-anchored proofread receipt. If any final SRT changes after that, rerun the proofread check and `mark-proofread`; `burn-cleanup` rejects stale receipt hashes by default.
+
 ## Local Gates
 
 After proofread and before burn, run and consume:

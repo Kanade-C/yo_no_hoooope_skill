@@ -27,7 +27,6 @@ Load only the reference needed for the current task:
 - `references/deepseek-prompts.md`: DeepSeek V4-Pro translation, self-polish, and note prompt policy.
 - `references/note-style.md`: episode-summary style, compression, topic selection, and output shape.
 - `references/review-policy.md`: public-release strict review coverage, reduced-review mode, QA gates, and tone priority.
-- `references/terms-and-notes.md`: compatibility router for the split reference files.
 
 ## Default Workflow
 
@@ -36,33 +35,18 @@ For full subtitle production, use the staged pipeline where possible:
 ```powershell
 python <skill_dir>\scripts\hoooope_subtitles.py pipeline <episode_dir>
 python <skill_dir>\scripts\hoooope_subtitles.py pipeline <episode_dir> --stage post-review
+python <skill_dir>\scripts\hoooope_subtitles.py mark-proofread <episode_dir>
 python <skill_dir>\scripts\hoooope_subtitles.py pipeline <episode_dir> --stage burn-cleanup
 python <skill_dir>\scripts\hoooope_subtitles.py cleanup <episode_dir>
 ```
 
-Default production flow:
-
-1. Read `references/workflow.md` and inspect the episode folder.
-2. If the user asked for summary-only, do not touch MP4s; read current final Chinese SRTs, write the summary, and stop.
-3. Organize each root MP4 into its own same-stem folder, preserving date-based stems such as `hope_25_0513`.
-4. Read `references/translation-and-asr.md`, `references/terms-glossary.md`, `references/deepseek-prompts.md`, and `references/review-policy.md`; append project glossary wording from `hoooope_terms.txt` when present, with `hooope_terms.txt` only as legacy fallback.
-5. Confirm the local ASR model paths, then transcribe raw ASR to `<stem>.orig.raw.srt` with Whisper large-v3-turbo plus local Silero VAD as the production backbone.
-6. Run `smooth-source` to create `<stem>.orig.srt`, then `orig-audit`; by default run Qwen3-ASR-1.7B risk-segment comparison to `<stem>.asr.compare.txt` as a high-quality sidecar. Use it to fix only obvious source errors that would poison downstream translation; never let Qwen overwrite the main Whisper timing SRT automatically.
-7. Run DeepSeek V4-Pro initial translation to `<stem>.deepseek.raw.srt`; pipeline defaults to `--translate-workers 2 --translate-context-blocks 20` for read-only context.
-8. Run DeepSeek V4-Pro self-polish to `<stem>.deepseek.polished.srt` and `<stem>.qa.txt`; polish cache includes dependency hashes for prompt, glossary, model, and chunk strategy.
-9. Copy polished output to `<stem>.srt`; read `references/review-and-qa.md` and `references/review-policy.md`, then Codex proofreads 100% of source/final subtitles with only-corrections edits.
-10. Run the local QA gates: `normalize-punctuation`, `review-todo`, `wrap-final`, `validate`, `baseline-report`, `lint-final --strict-public`, `terms-audit`, `proper-noun-candidates`, and `final-ready`; fix high-risk issues and rerun. `review-todo` must run before `wrap-final` physically splits blocks.
-11. Read `references/summary-and-tone.md`, `references/note-style.md`, and `references/review-policy.md`; do the Yomiya tone micro-review before final note generation.
-12. Generate per-video notes from final SRTs, inspect/compress them, then run `combine-summaries` to write one episode-level summary outside video folders.
-13. Burn final SRTs into MP4s with duration validation, run `screenshot-check`, inspect contact sheets, and reburn if visual QA fails.
-14. Run `cleanup` only after final subtitles, burned videos, screenshot QA, and the combined summary are confirmed. Do not delete screenshot-check files before contact sheets have been inspected.
-
-For resume work, scan checkpoints first and continue from the earliest missing or invalid stage. Do not restart completed valid work unless the user asks for a fresh run or a concrete defect requires regeneration.
+Always read `references/workflow.md` before acting on an episode folder: it holds the full step-by-step production flow, folder layout, checkpoints, resume rules, and the summary-only branch. Continue from the earliest missing or invalid checkpoint; do not restart completed valid work unless the user asks for a fresh run or a concrete defect requires regeneration.
 
 ## Non-Negotiables
 
 - Preserve quality: production uses Whisper large-v3-turbo plus local Silero VAD as the main ASR, Qwen3-ASR-1.7B risk-segment comparison as the default high-quality ASR enhancement, DeepSeek V4-Pro translation, DeepSeek V4-Pro self-polish, Codex final proofread, local QA gates, summary inspection, duration validation, and screenshot QA.
 - Public-release strict is the default: Codex final proofread covers 100% of source/final subtitle blocks. Reduced review is allowed only when the user explicitly trades quality for speed or cost.
+- After Codex proofread, write the hash-anchored proofread receipt with `mark-proofread`; `burn-cleanup` requires matching receipt evidence by default.
 - Summary-only means no MP4 organization, no ASR, no reburn, no cleanup, and no video edits.
 - Codex final proofread uses only-corrections editing: patch only changed blocks, preserve stable blocks, and never regenerate the full SRT as the review output.
 - Do not downgrade DeepSeek stages or skip self-polish for speed or cost unless the user explicitly requests that tradeoff.

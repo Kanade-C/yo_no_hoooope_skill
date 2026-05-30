@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib
 import importlib.util
 import json
@@ -11,19 +10,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unicodedata
 from pathlib import Path
 
-from hooope_lib import asr_audio as asr_audio_lib
-from hooope_lib import audit_rules as audit_rules_lib
-from hooope_lib import baseline as baseline_lib
-from hooope_lib import pipeline_state as pipeline_state_lib
-from hooope_lib import srt_io as srt_io_lib
-from hooope_lib.audit_rules import ASR_HOMOPHONE_CONTEXT_RULES, ASR_PROMPT_SEED_TERMS
+from hoooope_lib import asr_audio as asr_audio_lib
+from hoooope_lib import audit_rules as audit_rules_lib
+from hoooope_lib import baseline as baseline_lib
+from hoooope_lib import config as config_lib
+from hoooope_lib import line_wrap as line_wrap_lib
+from hoooope_lib import media_ops as media_ops_lib
+from hoooope_lib import pipeline as pipeline_lib
+from hoooope_lib import pipeline_state as pipeline_state_lib
+from hoooope_lib import proofread as proofread_lib
+from hoooope_lib import srt_util as srt_util_lib
+from hoooope_lib import source_smoothing as source_smoothing_lib
+from hoooope_lib import cleanup as cleanup_lib
+from hoooope_lib import final_review as final_review_lib
+from hoooope_lib.audit_rules import ASR_HOMOPHONE_CONTEXT_RULES, ASR_PROMPT_SEED_TERMS
 
 
 MEDIA_EXTS = {".ts", ".mp4", ".mkv", ".mov", ".webm", ".m4a", ".mp3", ".wav", ".flac"}
-DEFAULT_TRANSCRIBE_MODEL_DIR = "model/large_v3_turbo"
+DEFAULT_TRANSCRIBE_MODEL_DIR = "model/large_v3_turbo_ct2"
 DEFAULT_QWEN_ASR_MODEL_DIR = "model/qwen-3-asr-1.7b"
 DEFAULT_STABLE_REGROUP = "clues"
 PIPELINE_TRANSLATION_MODEL = "deepseek-v4-pro"
@@ -36,9 +42,6 @@ PIPELINE_DEEPSEEK_QA_SAMPLE_RATIO = 0.28
 PIPELINE_MIN_SUMMARY_CHARS = 1500
 PIPELINE_MAX_SUMMARY_CHARS = 3000
 PIPELINE_DEFAULT_VAD_ONNX = "model/silero_vad.onnx"
-JA_RE = re.compile(r"[\u3040-\u30ff]")
-HOOPE_RE = re.compile(r"\bHO+PE\b", re.IGNORECASE)
-BAD_HOST_TERMS = ("阳宫", "雏乃", "陽宮", "ひなの")
 BAD_FIXED_TERMS: dict[str, str] = {
     "AGVIOT": "AVIOT",
     "ＡＶＩＯＴ": "AVIOT",
@@ -69,58 +72,6 @@ SUSPICIOUS_TERMS: tuple[str, ...] = (
     "シープッチ",
     "Sheepッチ",
 )
-ASCII_PUNCT_RE = re.compile(r"[,!?:;]")
-KATAKANA_TERM_RE = re.compile(r"[\u30a1-\u30ffー]{3,}")
-LATIN_TERM_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9&'./+-]{2,}\b")
-TITLE_LIKE_RE = re.compile(r"[「『《](.*?)[」』》]")
-KANA_NICKNAME_RE = re.compile(r"[\u3041-\u309f\u30a1-\u30ffー]{2,}")
-LINE_SPLIT_CHARS = "，。！？；、： "
-STRONG_SPLIT_PUNCT = "，。！？；："
-WEAK_SPLIT_PUNCT = "、 /／"
-LEADING_CONNECTIVES = (
-    "但是", "不过", "然后", "所以", "而且", "因为", "如果", "虽然", "其实", "就是",
-    "还有", "或者", "以及", "并且", "可是", "结果", "于是", "另外", "毕竟",
-)
-TRAILING_PARTICLES = (
-    "的话", "之后", "以前", "时候", "这里", "那里", "这样", "那样", "这个", "那个",
-    "所以", "但是", "不过", "然后",
-)
-CLAUSE_END_CHARS = "了呢吧啊哦呀嘛啦的"
-PROTECTED_SPAN_RE = re.compile(
-    r"[A-Za-z][A-Za-z0-9&'./+\-]*(?:\s+[A-Za-z][A-Za-z0-9&'./+\-]*)*"
-    r"|\d+(?:[.:/年月日号-]\d+)*"
-)
-BRACKET_PAIRS = {
-    "「": "」",
-    "『": "』",
-    "《": "》",
-    "（": "）",
-    "(": ")",
-    "[": "]",
-    "【": "】",
-}
-_SPACY_ZH_NLP = None
-_SPACY_ZH_ATTEMPTED = False
-# Split scoring keeps long spoken subtitles readable without changing meaning:
-# balance weights prefer visually even halves, overflow penalties avoid lines
-# beyond release limits, punctuation/phrase bonuses favor natural clause breaks,
-# and side penalties reject tiny, Latin-heavy, or grammatically awkward halves.
-SPLIT_BALANCE_WEIGHT = 2.0
-SPLIT_LENGTH_BALANCE_WEIGHT = 1.2
-SPLIT_CHAR_OVERFLOW_PENALTY = 6
-SPLIT_WIDTH_OVERFLOW_PENALTY = 4
-SPLIT_STRONG_PUNCT_BONUS = -55
-SPLIT_WEAK_PUNCT_BONUS = -18
-SPLIT_LEADING_CONNECTIVE_BONUS = -16
-SPLIT_TRAILING_PARTICLE_BONUS = -10
-SPLIT_CLAUSE_END_BONUS = -6
-SPLIT_BEFORE_PUNCT_PENALTY = 30
-SPLIT_AWKWARD_LEFT_SUFFIX_PENALTY = 15
-SPLIT_AWKWARD_RIGHT_PREFIX_PENALTY = 12
-SPLIT_VERY_SHORT_SIDE_PENALTY = 20
-SPLIT_SHORT_SIDE_PENALTY = 18
-SPLIT_ASCII_SIDE_PENALTY = 55
-ASR_SUSPICIOUS_OPEN_RE = re.compile(r"(Open|OPEN|オープン|おーぷん)")
 SRT_TIMING_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}$")
 IGNORED_WORKBENCH_DIRS = {
     "deepseek_chunks",
@@ -140,95 +91,6 @@ TEXT_PUNCT_TRANSLATION = str.maketrans({
     ":": "：",
     ";": "；",
 })
-HOOOOPE_OPENING_MISHEAR_RE = re.compile(
-    r"(?:エ\s*クステンド|ネクスト|ステップ|STEP|Step).*"
-    r"(?:陽宮|羊宮|ようみや|ヨ[ーォ]?ミヤ|小宮|神谷).*"
-    r"(?:オープン|おーぷん|ポープ|ホップ|Open|OPEN|新)"
-)
-HOOOOPE_TITLE_MISHEAR_RE = re.compile(
-    r"(?:陽宮|羊宮|ようみや|ヨ[ーォ]?ミヤ|小宮|神谷).{0,8}"
-    r"(?:ポープ|ホップ|Open|OPEN|オープン|おーぷん)"
-)
-HOOOOPE_ACCOUNT_MISHEAR_RE = re.compile(
-    r"(?:番組公式|公式).{0,12}(?:x|X|エックス).{0,12}"
-    r"(?:アカウント).{0,16}(?:bx\s*ホープ|ex\s*hope|exhope|ホープ)"
-)
-AIUEO_COMPOSITION_MISHEAR_RE = re.compile(
-    r"(?:み[、,\s]*ず[、,\s]*の|水野).{0,12}"
-    r"(?:相植え|藍植え|愛植え|あいうえ|アイウエ|作文)"
-)
-SOURCE_TAIL_NOUN_RE = re.compile(
-    r"(?:生放送)?(?:番組|コーナー|企画|作品|楽曲|曲|テーマ|お題|お知らせ|"
-    r"メール|お便り|投稿|イラスト|名前|ニックネーム|時間)(?:です|でした)?$"
-)
-SOURCE_ATTRIBUTIVE_END_RE = re.compile(
-    r"(?:の|な|た|する|していく|届けていく|お届けしていく|となるよう|になるよう|"
-    r"という|みたいな|ような)$"
-)
-ROMAJI_BASE = {
-    "あ": "a", "い": "i", "う": "u", "え": "e", "お": "o",
-    "か": "ka", "き": "ki", "く": "ku", "け": "ke", "こ": "ko",
-    "さ": "sa", "し": "shi", "す": "su", "せ": "se", "そ": "so",
-    "た": "ta", "ち": "chi", "つ": "tsu", "て": "te", "と": "to",
-    "な": "na", "に": "ni", "ぬ": "nu", "ね": "ne", "の": "no",
-    "は": "ha", "ひ": "hi", "ふ": "fu", "へ": "he", "ほ": "ho",
-    "ま": "ma", "み": "mi", "む": "mu", "め": "me", "も": "mo",
-    "や": "ya", "ゆ": "yu", "よ": "yo",
-    "ら": "ra", "り": "ri", "る": "ru", "れ": "re", "ろ": "ro",
-    "わ": "wa", "を": "o", "ん": "n",
-    "が": "ga", "ぎ": "gi", "ぐ": "gu", "げ": "ge", "ご": "go",
-    "ざ": "za", "じ": "ji", "ず": "zu", "ぜ": "ze", "ぞ": "zo",
-    "だ": "da", "ぢ": "ji", "づ": "zu", "で": "de", "ど": "do",
-    "ば": "ba", "び": "bi", "ぶ": "bu", "べ": "be", "ぼ": "bo",
-    "ぱ": "pa", "ぴ": "pi", "ぷ": "pu", "ぺ": "pe", "ぽ": "po",
-    "ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o",
-}
-ROMAJI_DIGRAPHS = {
-    "きゃ": "kya", "きゅ": "kyu", "きょ": "kyo",
-    "しゃ": "sha", "しゅ": "shu", "しょ": "sho",
-    "ちゃ": "cha", "ちゅ": "chu", "ちょ": "cho",
-    "にゃ": "nya", "にゅ": "nyu", "にょ": "nyo",
-    "ひゃ": "hya", "ひゅ": "hyu", "ひょ": "hyo",
-    "みゃ": "mya", "みゅ": "myu", "みょ": "myo",
-    "りゃ": "rya", "りゅ": "ryu", "りょ": "ryo",
-    "ぎゃ": "gya", "ぎゅ": "gyu", "ぎょ": "gyo",
-    "じゃ": "ja", "じゅ": "ju", "じょ": "jo",
-    "びゃ": "bya", "びゅ": "byu", "びょ": "byo",
-    "ぴゃ": "pya", "ぴゅ": "pyu", "ぴょ": "pyo",
-}
-
-
-def fmt_time(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
-    h, rem = divmod(ms, 3_600_000)
-    m, rem = divmod(rem, 60_000)
-    s, ms = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def parse_srt_time(value: str) -> float:
-    match = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})", value.strip())
-    if not match:
-        raise ValueError(value)
-    h, m, s, ms = (int(part) for part in match.groups())
-    return h * 3600 + m * 60 + s + ms / 1000
-
-
-def display_width(text: str) -> float:
-    width = 0.0
-    for char in text:
-        if unicodedata.combining(char):
-            continue
-        if char in "\t\r\n":
-            continue
-        east_asian_width = unicodedata.east_asian_width(char)
-        if east_asian_width in {"F", "W"}:
-            width += 2.0
-        elif east_asian_width == "A":
-            width += 1.5
-        else:
-            width += 1.0
-    return width
 
 
 def iter_srt_entries(path: Path) -> list[tuple[str, str, list[str]]]:
@@ -242,76 +104,6 @@ def iter_srt_entries(path: Path) -> list[tuple[str, str, list[str]]]:
         text_lines = [line.strip() for line in lines[2:] if line.strip()]
         entries.append((number, timing, text_lines))
     return entries
-
-
-def find_term_issues(text: str, rules: dict[str, object] | None = None) -> list[str]:
-    issues: list[str] = []
-    fixed_terms = rules.get("bad_fixed_terms", BAD_FIXED_TERMS) if rules else BAD_FIXED_TERMS
-    for bad_term, suggestion in dict(fixed_terms).items():
-        if bad_term in text:
-            issues.append(f"{bad_term} -> {suggestion}")
-    return issues
-
-
-def text_payload(text_lines: list[str]) -> str:
-    return "\n".join(text_lines)
-
-
-def compact_text(text: str, limit: int = 80) -> str:
-    text = " ".join(text.replace("\n", " / ").split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "..."
-
-
-def chinese_char_count(text: str) -> int:
-    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
-
-
-def katakana_to_hiragana(text: str) -> str:
-    chars: list[str] = []
-    for char in text:
-        code = ord(char)
-        if 0x30A1 <= code <= 0x30F6:
-            chars.append(chr(code - 0x60))
-        else:
-            chars.append(char)
-    return "".join(chars)
-
-
-def romanize_kana(text: str) -> str:
-    text = katakana_to_hiragana(text.strip())
-    result: list[str] = []
-    geminate = False
-    idx = 0
-    while idx < len(text):
-        char = text[idx]
-        if char == "っ":
-            geminate = True
-            idx += 1
-            continue
-        if char == "ー":
-            if result:
-                last = result[-1][-1:]
-                if last in "aeiou":
-                    result[-1] += last
-            idx += 1
-            continue
-        pair = text[idx : idx + 2]
-        if pair in ROMAJI_DIGRAPHS:
-            piece = ROMAJI_DIGRAPHS[pair]
-            idx += 2
-        else:
-            piece = ROMAJI_BASE.get(char, "")
-            idx += 1
-        if not piece:
-            continue
-        if geminate and piece[0] not in "aeiou":
-            piece = piece[0] + piece
-        geminate = False
-        result.append(piece)
-    romanized = "".join(result)
-    return romanized[:1].upper() + romanized[1:] if romanized else ""
 
 
 def skill_reference_paths() -> list[Path]:
@@ -416,214 +208,6 @@ def build_initial_prompt(args: argparse.Namespace) -> str | None:
     return prompt or None
 
 
-def protected_split_spans(line: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    for match in PROTECTED_SPAN_RE.finditer(line):
-        if match.end() - match.start() > 1:
-            spans.append((match.start(), match.end()))
-
-    stack: list[tuple[str, int]] = []
-    closers = {close: open_ for open_, close in BRACKET_PAIRS.items()}
-    for idx, char in enumerate(line):
-        if char in BRACKET_PAIRS:
-            stack.append((char, idx))
-        elif char in closers:
-            for stack_idx in range(len(stack) - 1, -1, -1):
-                open_char, start = stack[stack_idx]
-                if open_char == closers[char]:
-                    spans.append((start, idx + 1))
-                    del stack[stack_idx:]
-                    break
-    return spans
-
-
-def inside_protected_span(index: int, spans: list[tuple[int, int]]) -> bool:
-    return any(start < index < end for start, end in spans)
-
-
-def get_spacy_zh_nlp():
-    global _SPACY_ZH_ATTEMPTED, _SPACY_ZH_NLP
-    if _SPACY_ZH_ATTEMPTED:
-        return _SPACY_ZH_NLP
-    _SPACY_ZH_ATTEMPTED = True
-    spec = importlib.util.find_spec("spacy")
-    if spec is None:
-        return None
-    try:
-        spacy = importlib.import_module("spacy")
-        for model_name in ("zh_core_web_md", "zh_core_web_sm"):
-            try:
-                _SPACY_ZH_NLP = spacy.load(model_name)
-                return _SPACY_ZH_NLP
-            except Exception:  # noqa: BLE001
-                continue
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
-def nlp_split_candidates(line: str) -> set[int]:
-    nlp = get_spacy_zh_nlp()
-    if nlp is None:
-        return set()
-    try:
-        doc = nlp(line)
-    except Exception:  # noqa: BLE001
-        return set()
-
-    candidates: set[int] = set()
-    preferred_deps = {"advmod", "mark", "cc", "conj", "dep", "punct", "ROOT"}
-    for token in doc:
-        end = token.idx + len(token.text)
-        if 0 < end < len(line):
-            candidates.add(end)
-        if token.dep_ in preferred_deps and 0 < token.idx < len(line):
-            candidates.add(token.idx)
-    for sent in getattr(doc, "sents", []):
-        end = sent.end_char
-        if 0 < end < len(line):
-            candidates.add(end)
-    return candidates
-
-
-def readable_split_candidates(line: str) -> list[int]:
-    spans = protected_split_spans(line)
-    candidates: set[int] = set(nlp_split_candidates(line))
-    candidates.update(idx + 1 for idx, char in enumerate(line) if char in LINE_SPLIT_CHARS)
-
-    for connective in LEADING_CONNECTIVES:
-        start = 0
-        while True:
-            idx = line.find(connective, start)
-            if idx < 0:
-                break
-            if idx > 0:
-                candidates.add(idx)
-            end = idx + len(connective)
-            if end < len(line):
-                candidates.add(end)
-            start = end
-
-    for particle in TRAILING_PARTICLES:
-        start = 0
-        while True:
-            idx = line.find(particle, start)
-            if idx < 0:
-                break
-            end = idx + len(particle)
-            if 0 < end < len(line):
-                candidates.add(end)
-            start = end
-
-    for idx, char in enumerate(line[:-1], start=1):
-        if char in CLAUSE_END_CHARS:
-            candidates.add(idx)
-
-    return sorted(
-        idx for idx in candidates
-        if 0 < idx < len(line)
-        and not inside_protected_span(idx, spans)
-        and line[:idx].strip()
-        and line[idx:].strip()
-    )
-
-
-def split_candidate_score(line: str, index: int, max_chars: int, max_width: float) -> float:
-    left = line[:index].strip()
-    right = line[index:].strip()
-    left_width = display_width(left)
-    right_width = display_width(right)
-    midpoint = len(line) / 2
-    score = abs(index - midpoint) * SPLIT_BALANCE_WEIGHT
-    score += abs(len(left) - len(right)) * SPLIT_LENGTH_BALANCE_WEIGHT
-    score += max(0, len(left) - max_chars) * SPLIT_CHAR_OVERFLOW_PENALTY
-    score += max(0, len(right) - max_chars) * SPLIT_CHAR_OVERFLOW_PENALTY
-    score += max(0.0, left_width - max_width) * SPLIT_WIDTH_OVERFLOW_PENALTY
-    score += max(0.0, right_width - max_width) * SPLIT_WIDTH_OVERFLOW_PENALTY
-
-    before = line[index - 1]
-    after = line[index] if index < len(line) else ""
-    if before in STRONG_SPLIT_PUNCT:
-        score += SPLIT_STRONG_PUNCT_BONUS
-    elif before in WEAK_SPLIT_PUNCT:
-        score += SPLIT_WEAK_PUNCT_BONUS
-    if any(right.startswith(conn) for conn in LEADING_CONNECTIVES):
-        score += SPLIT_LEADING_CONNECTIVE_BONUS
-    if any(left.endswith(particle) for particle in TRAILING_PARTICLES):
-        score += SPLIT_TRAILING_PARTICLE_BONUS
-    if before in CLAUSE_END_CHARS:
-        score += SPLIT_CLAUSE_END_BONUS
-    if after in "，。！？；、：":
-        score += SPLIT_BEFORE_PUNCT_PENALTY
-    if left[-1:] in "的地得":
-        score += SPLIT_AWKWARD_LEFT_SUFFIX_PENALTY
-    if right[:1] in "的地得了着过":
-        score += SPLIT_AWKWARD_RIGHT_PREFIX_PENALTY
-    if len(left) < 6 or len(right) < 6:
-        score += SPLIT_VERY_SHORT_SIDE_PENALTY
-    if len(left) < 10 or len(right) < 10:
-        score += SPLIT_SHORT_SIDE_PENALTY
-    if re.fullmatch(r"[A-Za-z0-9&'./+\-\s]+", left):
-        score += SPLIT_ASCII_SIDE_PENALTY
-    if re.fullmatch(r"[A-Za-z0-9&'./+\-\s]+", right):
-        score += SPLIT_ASCII_SIDE_PENALTY
-    return score
-
-
-def split_readable_line(line: str, max_chars: int, max_width: float) -> list[str]:
-    if len(line) <= max_chars and display_width(line) <= max_width:
-        return [line]
-    if not line:
-        return [line]
-    candidates = readable_split_candidates(line)
-    if candidates:
-        split_at = min(candidates, key=lambda idx: split_candidate_score(line, idx, max_chars, max_width))
-    else:
-        spans = protected_split_spans(line)
-        midpoint = len(line) // 2
-        fallback_candidates = [
-            idx for idx in range(1, len(line))
-            if not inside_protected_span(idx, spans)
-        ]
-        split_at = min(fallback_candidates or [midpoint], key=lambda idx: abs(idx - midpoint))
-    left = line[:split_at].strip()
-    right = line[split_at:].strip()
-    if not left or not right:
-        return [line]
-    return [left, right]
-
-
-def risk_reasons(number: str, timing: str, text: str, args: argparse.Namespace | None = None) -> list[str]:
-    reasons: list[str] = []
-    if JA_RE.search(text):
-        reasons.append("日文残留")
-    if find_term_issues(text):
-        reasons.append("固定译名")
-    if any(term in text for term in SUSPICIOUS_TERMS):
-        reasons.append("可疑专名")
-    if any(token != "HOOOOPE" for token in HOOPE_RE.findall(text)):
-        reasons.append("节目名")
-    if any(display_width(line) > 56 for line in text.splitlines()):
-        reasons.append("显示宽度")
-    if any(len(line) > 28 for line in text.splitlines()):
-        reasons.append("长行")
-    try:
-        start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-        duration = parse_srt_time(end_raw) - parse_srt_time(start_raw)
-        if duration > 30:
-            reasons.append(f"超长时间轴{duration:.1f}s")
-    except (ValueError, IndexError):
-        reasons.append("时间轴异常")
-    tone_markers = ("我觉得", "可能", "或许", "谢谢", "抱歉", "不好意思", "开心", "高兴", "喜欢", "怎么办", "真的", "感觉")
-    if any(marker in text for marker in tone_markers):
-        reasons.append("语气抽查")
-    if re.search(r"[？！…]|哈哈|诶|哎|咦|啊", text):
-        reasons.append("反应/笑点")
-    if args is not None and args.include_all_long and len(text) >= args.long_text_chars:
-        reasons.append("长句信息量")
-    return reasons
-
-
 def require_file(path: Path, label: str) -> Path:
     path = path.resolve()
     if not path.exists():
@@ -645,7 +229,12 @@ def validate_model(model_dir: Path) -> Path:
 
 
 def stable_whisper_backend(model_dir: Path) -> str:
-    return "faster" if (model_dir / "model.bin").exists() else "hf"
+    if (model_dir / "model.bin").exists():
+        return "faster"
+    raise RuntimeError(
+        f"Unsupported Whisper model directory for production ASR: {model_dir}. "
+        "Use a CTranslate2/faster-whisper directory with model.bin, such as model/large_v3_turbo_ct2."
+    )
 
 
 def compute_type_for_device(device: str | None, requested: str | None) -> str:
@@ -755,14 +344,11 @@ def transcribe_stable(args: argparse.Namespace, src: Path, out: Path, model_dir:
         print(f"Using stable-whisper {backend} backend: model={model_dir} device={device} compute_type={compute_type}")
         print(f"Using local Silero VAD ONNX: {vad_onnx}")
         print(f"Using stable-whisper regroup policy: {args.regroup}")
-        if backend == "faster":
-            model = stable_whisper.load_faster_whisper(
-                str(model_dir),
-                device=device,
-                compute_type=compute_type,
-            )
-        else:
-            model = stable_whisper.load_hf_whisper(str(model_dir), device=device)
+        model = stable_whisper.load_faster_whisper(
+            str(model_dir),
+            device=device,
+            compute_type=compute_type,
+        )
         common_kwargs = {
             "language": "ja",
             "task": "transcribe",
@@ -805,20 +391,20 @@ def transcribe(args: argparse.Namespace) -> None:
 
 def validate_srt_file(path: Path) -> tuple[int, list[int]]:
     try:
-        return srt_io_lib.validate_file(path)
+        return srt_util_lib.validate_file(path)
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
 
 
 def read_srt_blocks(path: Path) -> list[str]:
     try:
-        return srt_io_lib.read_blocks(path)
+        return srt_util_lib.read_blocks(path)
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
 
 
 def write_srt_blocks(path: Path, blocks: list[str]) -> None:
-    srt_io_lib.write_blocks(path, blocks)
+    srt_util_lib.write_blocks(path, blocks)
 
 
 def is_under_ignored_workbench_dir(path: Path) -> bool:
@@ -902,290 +488,6 @@ def normalize_punctuation(args: argparse.Namespace) -> None:
     print(f"normalize-punctuation files={len(subtitles)} changed_lines={total_changed}")
 
 
-def split_timing(timing: str) -> tuple[float, float]:
-    start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-    return parse_srt_time(start_raw), parse_srt_time(end_raw)
-
-
-def make_timing(start: float, end: float) -> str:
-    return f"{fmt_time(start)} --> {fmt_time(end)}"
-
-
-JA_TERMINAL_ENDINGS = (
-    "\u3002", "\uff01", "\uff1f", "?", "!",
-    "\u3067\u3059", "\u307e\u3059", "\u3067\u3057\u305f", "\u307e\u3057\u305f",
-    "\u304f\u3060\u3055\u3044", "\u304f\u3060\u3055\u3044\u306d", "\u3068\u601d\u3044\u307e\u3059",
-)
-JA_CONTINUATION_ENDINGS = (
-    "\u3001", "\uff0c", "\u3068", "\u3066", "\u3067", "\u306b", "\u3092", "\u304c", "\u306f", "\u3082", "\u306e",
-    "\u4eca\u3001", "\u306e\u3067", "\u306e\u3067\u3001", "\u3093\u3067", "\u3051\u3069", "\u3051\u308c\u3069", "\u3051\u308c\u3069\u3082",
-)
-JA_CLAUSE_PATTERNS = (
-    "\u3067\u3059\u306d \u306b\u306f", "\u3067\u3059\u304c", "\u306e\u3067", "\u3051\u308c\u3069\u3082", "\u3067\u3059\u3051\u308c\u3069\u3082", "\u3068\u3044\u3046\u3053\u3068\u3067",
-)
-
-
-def is_terminal_source_text(text: str) -> bool:
-    stripped = text.strip()
-    return bool(stripped) and stripped.endswith(JA_TERMINAL_ENDINGS)
-
-
-def is_continuation_source_text(text: str) -> bool:
-    stripped = text.strip()
-    return not stripped or stripped.endswith(JA_CONTINUATION_ENDINGS)
-
-
-def source_needs_more_context(text: str, duration: float, args: argparse.Namespace) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return True
-    if is_terminal_source_text(stripped):
-        return False
-    if is_continuation_source_text(stripped):
-        return True
-    if len(stripped) < args.min_semantic_chars:
-        return True
-    if duration < args.min_semantic_duration_seconds and len(stripped) < args.comfort_semantic_chars:
-        return True
-    return False
-
-
-def is_source_tail_noun_fragment(text: str, args: argparse.Namespace) -> bool:
-    stripped = re.sub(r"\s+", "", text.strip())
-    if not stripped or len(stripped) > args.tail_fragment_chars:
-        return False
-    return bool(SOURCE_TAIL_NOUN_RE.search(stripped))
-
-
-def should_merge_tail_noun_fragment(current: str, nxt: str, args: argparse.Namespace) -> bool:
-    if not is_source_tail_noun_fragment(nxt, args):
-        return False
-    current_stripped = re.sub(r"\s+", "", current.strip())
-    if not current_stripped:
-        return True
-    if current_stripped.endswith(JA_CONTINUATION_ENDINGS):
-        return True
-    return bool(SOURCE_ATTRIBUTIVE_END_RE.search(current_stripped))
-
-
-def source_has_pending_attributive_tail(text: str) -> bool:
-    stripped = re.sub(r"\s+", "", text.strip())
-    return bool(stripped and SOURCE_ATTRIBUTIVE_END_RE.search(stripped))
-
-
-def complete_pending_source_chains(entries: list[dict[str, float | str]], args: argparse.Namespace) -> list[dict[str, float | str]]:
-    completed: list[dict[str, float | str]] = []
-    idx = 0
-    while idx < len(entries):
-        current = dict(entries[idx])
-        if idx + 1 < len(entries):
-            nxt = entries[idx + 1]
-            gap = float(nxt["start"]) - float(current["end"])
-            combined_len = len(str(current["text"])) + len(str(nxt["text"]))
-            combined_duration = float(nxt["end"]) - float(current["start"])
-            if (
-                gap <= args.tail_chain_merge_gap_seconds
-                and combined_len <= args.tail_chain_max_chars
-                and combined_duration <= args.tail_chain_max_duration_seconds
-                and (
-                    source_needs_more_context(
-                        str(current["text"]),
-                        float(current["end"]) - float(current["start"]),
-                        args,
-                    )
-                    or source_has_pending_attributive_tail(str(current["text"]))
-                )
-                and is_terminal_source_text(str(nxt["text"]))
-            ):
-                current["end"] = nxt["end"]
-                current["text"] = (str(current["text"]) + " " + str(nxt["text"])).strip()
-                idx += 1
-        completed.append(current)
-        idx += 1
-    return completed
-
-
-def source_split_points(text: str) -> list[int]:
-    points: list[int] = []
-    for pattern in JA_CLAUSE_PATTERNS:
-        idx = text.find(pattern)
-        if idx > 0:
-            if pattern == "\u3067\u3059\u306d \u306b\u306f":
-                points.append(idx + len("\u3067\u3059\u306d"))
-            else:
-                points.append(idx + len(pattern))
-    for idx, char in enumerate(text[:-1], start=1):
-        if char in "\u3001\u3002\uff01\uff1f?!" and idx > 8:
-            points.append(idx)
-    return sorted(set(idx for idx in points if 6 <= idx <= len(text) - 6))
-
-
-def smooth_source_srt(args: argparse.Namespace) -> None:
-    path = Path(args.subtitle)
-    entries = []
-    for number, timing, text_lines in iter_srt_entries(path):
-        start, end = split_timing(timing)
-        entries.append({"start": start, "end": end, "text": " ".join(text_lines).strip()})
-
-    merged = []
-    idx = 0
-    while idx < len(entries):
-        current = dict(entries[idx])
-        while idx + 1 < len(entries):
-            nxt = entries[idx + 1]
-            gap = nxt["start"] - current["end"]
-            combined_len = len(current["text"]) + len(nxt["text"])
-            combined_duration = nxt["end"] - current["start"]
-            orphan_fragment = len(current["text"].strip()) <= args.orphan_fragment_chars and not is_terminal_source_text(current["text"])
-            tail_fragment = should_merge_tail_noun_fragment(current["text"], nxt["text"], args)
-            allowed_gap = (
-                args.tail_merge_gap_seconds
-                if tail_fragment
-                else args.orphan_merge_gap_seconds
-                if orphan_fragment
-                else args.merge_gap_seconds
-            )
-            allowed_duration = (
-                args.tail_max_merged_duration_seconds
-                if tail_fragment
-                else args.orphan_max_merged_duration_seconds
-                if orphan_fragment
-                else args.max_merged_duration_seconds
-            )
-            if (
-                gap <= allowed_gap
-                and combined_len <= args.max_merged_chars
-                and combined_duration <= allowed_duration
-                and (
-                    tail_fragment
-                    or source_needs_more_context(
-                        current["text"],
-                        current["end"] - current["start"],
-                        args,
-                    )
-                )
-            ):
-                current["end"] = nxt["end"]
-                current["text"] = (current["text"] + " " + nxt["text"]).strip()
-                idx += 1
-                continue
-            break
-        merged.append(current)
-        idx += 1
-
-    merged = complete_pending_source_chains(merged, args)
-
-    smoothed = []
-    for entry in merged:
-        duration = entry["end"] - entry["start"]
-        text = entry["text"]
-        points = source_split_points(text)
-        if duration >= args.split_duration_seconds and len(text) >= args.split_chars and points:
-            midpoint = len(text) / 2
-            split_at = min(points, key=lambda point: abs(point - midpoint))
-            left = text[:split_at].strip(" \u3001")
-            right = text[split_at:].strip(" \u3001")
-            left = re.sub(r"\s*\u306b\u306f$", "", left)
-            right = re.sub(r"^\u306b\u306f\s*", "", right)
-            if left and right:
-                ratio = max(0.25, min(0.75, len(left) / (len(left) + len(right))))
-                mid_time = entry["start"] + duration * ratio
-                smoothed.append({"start": entry["start"], "end": mid_time, "text": left})
-                smoothed.append({"start": mid_time, "end": entry["end"], "text": right})
-                continue
-        smoothed.append(entry)
-
-    blocks = []
-    for number, entry in enumerate(smoothed, start=1):
-        blocks.append("\n".join([str(number), make_timing(entry["start"], entry["end"]), entry["text"]]))
-
-    output = Path(args.output) if args.output else path
-    write_srt_blocks(output, blocks)
-    print(f"smooth-source blocks={len(entries)} -> {len(smoothed)} output={output.resolve()}")
-
-
-def orig_audit(args: argparse.Namespace) -> None:
-    subtitle = Path(args.subtitle).resolve()
-    entries = iter_srt_entries(subtitle)
-    rules = audit_rules_lib.load_audit_rules(args, subtitle, bad_fixed_terms=BAD_FIXED_TERMS, suspicious_terms=SUSPICIOUS_TERMS)
-    issues: list[str] = [
-        "# HOOOOPE Japanese source SRT audit",
-        f"source: {subtitle}",
-        "",
-    ]
-    issue_count = 0
-
-    previous_text = ""
-    repeat_count = 1
-    for idx, (number, timing, text_lines) in enumerate(entries):
-        text = "".join(text_lines).strip()
-        reasons: list[str] = []
-        if not text:
-            reasons.append("empty source text")
-        if ASR_SUSPICIOUS_OPEN_RE.search(text):
-            reasons.append("possible HOOOOPE misheard as Open/opun")
-        if "HOPE" in text and "HOOOOPE" not in text:
-            reasons.append("possible HOOOOPE spelling issue")
-        if HOOOOPE_OPENING_MISHEAR_RE.search(text):
-            reasons.append("likely opening/title ASR error for Extend Step HOOOOPE")
-        if HOOOOPE_TITLE_MISHEAR_RE.search(text) and "HOOOOPE" not in text:
-            reasons.append("likely program title ASR error for 羊宮妃那のHOOOOPE")
-        if HOOOOPE_ACCOUNT_MISHEAR_RE.search(text):
-            reasons.append("official X account or hashtag line may be misrecognized")
-        if AIUEO_COMPOSITION_MISHEAR_RE.search(text):
-            reasons.append("possible あいうえお作文 / 水野 acrostic ASR error")
-        context_start = max(0, idx - args.context_window)
-        context_end = min(len(entries), idx + args.context_window + 1)
-        context_text = " ".join("".join(row[2]) for row in entries[context_start:context_end])
-        for rule in audit_rules_lib.ordered_rule_items(rules, "homophone_context_rules"):
-            pattern = re.compile(str(rule.get("pattern", "")))
-            context_tokens = tuple(str(token) for token in rule.get("context", []))
-            if pattern.search(text) and any(token in context_text for token in context_tokens):
-                reasons.append(str(rule.get("reason", "possible homophone ASR error; verify surrounding context")))
-        for rule in audit_rules_lib.ordered_rule_items(rules, "source_regex_rules"):
-            pattern = re.compile(str(rule.get("pattern", "")))
-            if pattern.search(text):
-                detail = str(rule.get("reason", rule.get("id", "source regex rule")))
-                reasons.append(detail)
-        for bad_term in ("AGVIOT", "ＡＶＩＯＴ", "生驹", "水野サク", "サポーテッドバイ"):
-            if bad_term in text:
-                reasons.append(f"suspicious ASR term: {bad_term}")
-        if re.search(r"[A-Za-z]{5,}", text) and not any(ok in text for ok in ("HOOOOPE", "AVIOT", "After", "Talk", "Step", "Room")):
-            reasons.append("unusual long Latin token in Japanese source")
-        if len(text) <= args.min_chars:
-            reasons.append("very short block; check missed short reaction only if context matters")
-        try:
-            start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-            duration = parse_srt_time(end_raw) - parse_srt_time(start_raw)
-            if duration >= args.long_duration_seconds and len(text) <= args.short_text_chars:
-                reasons.append(f"long duration with short text: {duration:.1f}s")
-        except (ValueError, IndexError):
-            reasons.append("invalid timing")
-
-        if text == previous_text:
-            repeat_count += 1
-            if repeat_count >= 3:
-                reasons.append(f"repeated source text x{repeat_count}")
-        else:
-            repeat_count = 1
-        previous_text = text
-
-        if reasons:
-            issue_count += 1
-            issues.extend([
-                f"## #{number} {timing}",
-                f"- reasons: {', '.join(reasons)}",
-                f"- text: {text}",
-                "",
-            ])
-
-    output = Path(args.output) if args.output else subtitle.with_name(f"{subtitle.stem}.audit.txt")
-    output.write_text("\n".join(issues).strip() + "\n", encoding="utf-8-sig")
-    print(f"orig-audit entries={len(entries)} issues={issue_count} output={output.resolve()}")
-    if issue_count and args.fail_on_issues:
-        raise SystemExit(1)
-
-
 def qwen_result_text(item) -> str:
     if isinstance(item, str):
         return item.strip()
@@ -1231,7 +533,7 @@ def qwen_compare(args: argparse.Namespace) -> None:
     risk_numbers = audit_risk_numbers(Path(args.audit)) if args.audit else set()
     entries = iter_srt_entries(orig)
     if risk_numbers:
-        selected = [entry for entry in entries if entry[0] in risk_numbers]
+        selected = [entry for entry in entries if entry[0].isdigit() and int(entry[0]) in risk_numbers]
     else:
         selected = []
     selected = selected[: max(1, args.max_segments)]
@@ -1271,8 +573,8 @@ def qwen_compare(args: argparse.Namespace) -> None:
         segment_paths: list[Path] = []
         for number, timing, text_lines in selected:
             start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-            start = max(0.0, parse_srt_time(start_raw) - args.padding_seconds)
-            end = parse_srt_time(end_raw) + args.padding_seconds
+            start = max(0.0, srt_util_lib.parse_srt_time(start_raw) - args.padding_seconds)
+            end = srt_util_lib.parse_srt_time(end_raw) + args.padding_seconds
             wav = asr_audio_lib.extract_segment_wav(media, start, max(0.1, end - start), args.audio_sample_rate)
             temp_paths.append(wav)
             segment_paths.append(wav)
@@ -1297,275 +599,25 @@ def qwen_compare(args: argparse.Namespace) -> None:
     print(f"qwen-compare segments={len(selected)} output={output.resolve()}")
 
 
-def lint_final(args: argparse.Namespace) -> None:
-    subtitle = Path(args.subtitle)
-    count, bad = validate_srt_file(subtitle)
-    issues: list[str] = []
-    if bad:
-        issues.append(f"[结构错误] blocks={count}, bad={bad[:20]}")
-
-    entries = iter_srt_entries(subtitle)
-    previous_text = ""
-    repeat_count = 1
-    for number, timing, text_lines in entries:
-        text = "\n".join(text_lines)
-
-        if not text:
-            issues.append(f"[空字幕] #{number}")
-        if len(text_lines) > 2:
-            issues.append(f"[超过两行] #{number}: {len(text_lines)} lines")
-        for line in text_lines:
-            if len(line) > args.max_line_chars:
-                issues.append(f"[单行过长] #{number}: {len(line)} chars: {line}")
-            width = display_width(line)
-            if width > args.max_line_width:
-                issues.append(f"[显示宽度过长] #{number}: {width:.1f} units: {line}")
-            if args.strict_public and ASCII_PUNCT_RE.search(line):
-                issues.append(f"[公开发布标点需统一] #{number}: {line}")
-        try:
-            start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-            duration = parse_srt_time(end_raw) - parse_srt_time(start_raw)
-            if duration > args.max_duration_seconds:
-                issues.append(
-                    f"[字幕持续过长需Codex处理] #{number}: {duration:.1f}s: {text.replace(chr(10), ' / ')}"
-                )
-        except (ValueError, IndexError):
-            issues.append(f"[时间轴格式异常] #{number}: {timing}")
-        if JA_RE.search(text):
-            issues.append(f"[疑似日文残留] #{number}: {text.replace(chr(10), ' / ')}")
-        for token in HOOPE_RE.findall(text):
-            if token != "HOOOOPE":
-                issues.append(f"[节目名疑似错误] #{number}: {token}: {text.replace(chr(10), ' / ')}")
-        if re.search(r"\bOpen\b|\bOPEN\b", text) and (
-            "Extend Step" in text or "HOOOOPE" in text or "羊宫妃那" in text
-        ):
-            issues.append(f"[开场疑似误译Open] #{number}: {text.replace(chr(10), ' / ')}")
-        for bad_term in BAD_HOST_TERMS:
-            if bad_term in text:
-                issues.append(f"[人名疑似错误] #{number}: {bad_term}: {text.replace(chr(10), ' / ')}")
-                break
-        term_issues = find_term_issues(text)
-        if term_issues:
-            issues.append(
-                f"[固定译名疑似错误] #{number}: {'; '.join(term_issues)}: {text.replace(chr(10), ' / ')}"
-            )
-        if text == previous_text:
-            repeat_count += 1
-            if args.strict_public and repeat_count >= 3:
-                issues.append(f"[连续重复字幕] #{number}: repeated {repeat_count} times: {text.replace(chr(10), ' / ')}")
-        else:
-            previous_text = text
-            repeat_count = 1
-
-    print(f"lint-final blocks={len(entries)} issues={len(issues)}")
-    for issue in issues[: args.max_report]:
-        print(issue)
-    if len(issues) > args.max_report:
-        print(f"... {len(issues) - args.max_report} more issues")
-    if issues and not args.warn_only:
-        raise SystemExit(1)
-
-
-def terms_audit(args: argparse.Namespace) -> None:
-    subtitle = Path(args.subtitle)
-    count, bad = validate_srt_file(subtitle)
-    rules = audit_rules_lib.load_audit_rules(args, subtitle, bad_fixed_terms=BAD_FIXED_TERMS, suspicious_terms=SUSPICIOUS_TERMS)
-    suspicious_terms = tuple(str(term) for term in rules.get("suspicious_terms", SUSPICIOUS_TERMS))
-    issues: list[str] = []
-    if bad:
-        issues.append(f"[结构错误] blocks={count}, bad={bad[:20]}")
-
-    for number, _timing, text_lines in iter_srt_entries(subtitle):
-        text = "\n".join(text_lines)
-        for issue in find_term_issues(text, rules):
-            issues.append(f"[固定译名疑似错误] #{number}: {issue}: {text.replace(chr(10), ' / ')}")
-        for term in suspicious_terms:
-            if term in text:
-                issues.append(f"[可疑专有名词] #{number}: {term}: {text.replace(chr(10), ' / ')}")
-        if JA_RE.search(text):
-            issues.append(f"[假名/日文残留] #{number}: {text.replace(chr(10), ' / ')}")
-        for token in HOOPE_RE.findall(text):
-            if token != "HOOOOPE":
-                issues.append(f"[节目名疑似错误] #{number}: {token}: {text.replace(chr(10), ' / ')}")
-
-    print(f"terms-audit blocks={count} issues={len(issues)}")
-    for issue in issues[: args.max_report]:
-        print(issue)
-    if len(issues) > args.max_report:
-        print(f"... {len(issues) - args.max_report} more issues")
-    if issues and not args.warn_only:
-        raise SystemExit(1)
-
-
-def long_block_split_point(text: str, args: argparse.Namespace) -> int | None:
-    compact = " ".join(text.split())
-    if len(compact) < args.sub_split_min_chars:
-        return None
-    strong_candidates: list[int] = []
-    weak_candidates: list[int] = []
-    for idx, char in enumerate(compact[:-1], start=1):
-        if not args.sub_split_min_side_chars <= idx <= len(compact) - args.sub_split_min_side_chars:
-            continue
-        if char in STRONG_SPLIT_PUNCT:
-            strong_candidates.append(idx)
-        elif char in WEAK_SPLIT_PUNCT:
-            weak_candidates.append(idx)
-    candidates = strong_candidates or weak_candidates
-    if not candidates:
-        return None
-    midpoint = len(compact) / 2
-    return min(candidates, key=lambda point: abs(point - midpoint))
-
-
-def split_long_final_block(number: str, timing: str, text: str, args: argparse.Namespace) -> list[tuple[str, str, str]]:
-    try:
-        start, end = split_timing(timing)
-    except (ValueError, IndexError):
-        return [(number, timing, text)]
-    duration = end - start
-    compact_len = len("".join(text.split()))
-    if args.no_sub_split or (
-        duration < args.sub_split_duration_seconds
-        and compact_len < args.sub_split_chars
-    ):
-        return [(number, timing, text)]
-    split_at = long_block_split_point(text, args)
-    if split_at is None:
-        return [(number, timing, text)]
-
-    compact = " ".join(text.split())
-    split_char = compact[split_at - 1] if split_at > 0 else ""
-    left = compact[:split_at].strip()
-    right = compact[split_at:].lstrip(STRONG_SPLIT_PUNCT + WEAK_SPLIT_PUNCT).strip()
-    if split_char in WEAK_SPLIT_PUNCT:
-        left = left.rstrip(WEAK_SPLIT_PUNCT).strip()
-    if not left or not right:
-        return [(number, timing, text)]
-
-    ratio = len(left) / (len(left) + len(right))
-    mid_time = start + duration * max(0.35, min(0.65, ratio))
-    if mid_time - start < args.sub_split_min_duration_seconds or end - mid_time < args.sub_split_min_duration_seconds:
-        return [(number, timing, text)]
-    return [
-        (number, make_timing(start, mid_time), left),
-        (number, make_timing(mid_time, end), right),
-    ]
-
-
 def wrap_final(args: argparse.Namespace) -> None:
-    subtitle = require_file(Path(args.subtitle), "Final Chinese SRT")
-    review_todo = subtitle.with_name(f"{subtitle.stem}.review.todo.txt")
-    if not review_todo.exists():
-        print(f"[wrap-final] warning: {review_todo.name} not found; run review-todo before wrap-final so block numbers remain aligned")
-    blocks = read_srt_blocks(subtitle)
-    updated_entries: list[tuple[str, str, list[str]]] = []
-    changed = 0
-    split_long = 0
-    for block in blocks:
-        lines = block.splitlines()
-        if len(lines) < 3:
-            updated_entries.append((str(len(updated_entries) + 1), lines[1] if len(lines) > 1 else "", lines[2:]))
-            continue
-        number, timing = lines[0], lines[1]
-        text = " ".join(line.strip() for line in lines[2:] if line.strip())
-        split_entries = split_long_final_block(number, timing, text, args)
-        if len(split_entries) > 1:
-            split_long += 1
-        if len(split_entries) > 1 or text != " ".join(line.strip() for line in lines[2:] if line.strip()):
-            changed += 1
-        for _orig_number, split_timing_text, split_text in split_entries:
-            wrapped = split_readable_line(split_text, args.max_line_chars, args.max_line_width)
-            if len(wrapped) > 2:
-                wrapped = wrapped[:2]
-            if len(split_entries) == 1 and wrapped != lines[2:]:
-                changed += 1
-            updated_entries.append(("", split_timing_text, wrapped))
-
-    updated = [
-        "\n".join([str(idx), timing, *wrapped])
-        for idx, (_number, timing, wrapped) in enumerate(updated_entries, start=1)
-    ]
-    output = Path(args.output) if args.output else subtitle
-    if changed and not args.dry_run:
-        write_srt_blocks(output, updated)
-    print(f"wrap-final blocks={len(blocks)} -> {len(updated)} changed={changed} split_long={split_long} output={output.resolve()}")
-
-
-def review_todo(args: argparse.Namespace) -> None:
-    orig = require_file(Path(args.orig), "Original Japanese SRT")
-    final = require_file(Path(args.final), "Final Chinese SRT")
-    orig_entries = {number: (timing, text_payload(lines)) for number, timing, lines in iter_srt_entries(orig)}
-    final_entries = iter_srt_entries(final)
-    rows: list[str] = [
-        "# HOOOOPE subtitle review todo",
-        "",
-        "Review these blocks before public release. They are selected by automatic risk signals; do not rewrite unless the Japanese source supports the edit.",
-        "",
-    ]
-    count = 0
-    for number, timing, lines in final_entries:
-        zh = text_payload(lines)
-        reasons = risk_reasons(number, timing, zh, args)
-        ja_timing, ja = orig_entries.get(number, ("", ""))
-        if ja and args.length_ratio:
-            ja_len = max(1, len(ja))
-            zh_len = len(zh.replace("\n", ""))
-            ratio = zh_len / ja_len
-            if ratio < args.min_ratio or ratio > args.max_ratio:
-                reasons.append(f"日中信息量比{ratio:.2f}")
-        if not reasons:
-            continue
-        count += 1
-        rows.extend(
-            [
-                f"## #{number} {timing}",
-                f"- reason: {', '.join(dict.fromkeys(reasons))}",
-                f"- JA: {compact_text(ja, args.text_limit)}",
-                f"- ZH: {compact_text(zh, args.text_limit)}",
-                "",
-            ]
-        )
-    out = Path(args.output) if args.output else final.with_name(f"{final.stem}.review.todo.txt")
-    out.write_text("\n".join(rows).strip() + "\n", encoding="utf-8-sig")
-    print(f"Wrote {out.resolve()} items={count}")
-
-
-def proper_noun_candidates(args: argparse.Namespace) -> None:
-    orig = require_file(Path(args.orig), "Original Japanese SRT")
-    counts: dict[str, int] = {}
-    examples: dict[str, str] = {}
-    for _number, _timing, lines in iter_srt_entries(orig):
-        text = text_payload(lines)
-        candidates = []
-        candidates.extend(KATAKANA_TERM_RE.findall(text))
-        candidates.extend(LATIN_TERM_RE.findall(text))
-        candidates.extend(match.group(1).strip() for match in TITLE_LIKE_RE.finditer(text) if match.group(1).strip())
-        for candidate in candidates:
-            if len(candidate) < args.min_chars:
-                continue
-            counts[candidate] = counts.get(candidate, 0) + 1
-            examples.setdefault(candidate, compact_text(text, 100))
-    nickname_rows = ["## Kana nickname romanization candidates", ""]
-    nickname_seen: set[str] = set()
-    for term, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        if not KANA_NICKNAME_RE.fullmatch(term):
-            continue
-        romanized = romanize_kana(term)
-        if not romanized or term in nickname_seen:
-            continue
-        nickname_seen.add(term)
-        nickname_rows.append(f"- `{term}` -> `{romanized}` x{count}: {examples[term]}")
-    rows = ["# Proper noun candidates", ""]
-    if len(nickname_rows) > 2:
-        rows.extend(nickname_rows)
-        rows.append("")
-        rows.append("## Raw candidates")
-        rows.append("")
-    for term, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[: args.max_terms]:
-        rows.append(f"- `{term}` x{count}: {examples[term]}")
-    out = Path(args.output) if args.output else orig.with_name(f"{orig.stem}.proper-nouns.txt")
-    out.write_text("\n".join(rows).strip() + "\n", encoding="utf-8-sig")
-    print(f"Wrote {out.resolve()} terms={len(counts)}")
+    subtitle = Path(args.subtitle)
+    output = Path(args.output) if args.output else None
+    config = line_wrap_lib.WrapFinalConfig(
+        subtitle=subtitle,
+        output=output,
+        max_line_chars=args.max_line_chars,
+        max_line_width=args.max_line_width,
+        sub_split_duration_seconds=args.sub_split_duration_seconds,
+        sub_split_chars=args.sub_split_chars,
+        sub_split_min_chars=args.sub_split_min_chars,
+        sub_split_min_side_chars=args.sub_split_min_side_chars,
+        sub_split_min_duration_seconds=args.sub_split_min_duration_seconds,
+        no_sub_split=args.no_sub_split,
+        dry_run=args.dry_run,
+    )
+    block_count, updated_count, changed, split_long = line_wrap_lib.wrap_final_file(config)
+    resolved_output = (output if output else subtitle).resolve()
+    print(f"wrap-final blocks={block_count} -> {updated_count} changed={changed} split_long={split_long} output={resolved_output}")
 
 
 def split_srt(args: argparse.Namespace) -> None:
@@ -1624,20 +676,7 @@ def summary_template(args: argparse.Namespace) -> None:
         raise SystemExit(f"Subtitle validation failed: blocks={count}, bad={bad[:20]}")
 
     out = Path(args.output) if args.output else src.with_name(f"{src.stem}.summary.txt")
-    template = f"""[日期可选] 小羊 HOOOOPE 笔记
-
-[根据 {subtitle.name} 的润色中文字幕，用 1-2 句总述本期氛围和主要内容。]
-
-----------
-
-『[话题/来信标题]』
-[大致时间] 听众来信或节目话题讲了什么，羊宫妃那怎么回应，有什么有趣的展开。写成自然段，不要写成要点列表。
-
-『[下一个话题/来信标题]』
-[大致时间] 继续用自然段概括。可以根据节目内容添加更多话题段落。
-
-#羊宫妃那
-"""
+    template = config_lib.SUMMARY_TEMPLATE.format(subtitle_name=subtitle.name)
     out.write_text(template, encoding="utf-8-sig")
     print(f"Wrote {out.resolve()}")
 
@@ -1647,32 +686,10 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def ffprobe_duration(path: Path) -> float:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path.resolve()),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return float(result.stdout.strip())
-
-
 def verify_duration_pair(source: Path, output: Path, tolerance: float) -> None:
-    src_duration = ffprobe_duration(source)
-    out_duration = ffprobe_duration(output)
-    diff = abs(src_duration - out_duration)
-    print(f"source={src_duration:.3f}s output={out_duration:.3f}s diff={diff:.3f}s")
-    if diff > tolerance:
-        raise SystemExit(f"Duration mismatch exceeds {tolerance}s: {diff:.3f}s")
+    media_ops_lib.verify_duration_pair(
+        media_ops_lib.DurationCheckConfig(source=source, output=output, tolerance=tolerance)
+    )
 
 
 def burn_command(args: argparse.Namespace, src: Path, out: Path, vf: str, encoder: str) -> list[str]:
@@ -1772,7 +789,7 @@ def screenshot_check(args: argparse.Namespace) -> None:
     if subtitle is not None:
         require_file(subtitle, "Subtitle file")
 
-    duration = ffprobe_duration(media)
+    duration = media_ops_lib.ffprobe_duration(media)
     times = [duration * pct / 100 for pct in args.percent]
 
     if subtitle is not None:
@@ -1783,8 +800,8 @@ def screenshot_check(args: argparse.Namespace) -> None:
                 continue
             try:
                 start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-                start = parse_srt_time(start_raw)
-                end = parse_srt_time(end_raw)
+                start = srt_util_lib.parse_srt_time(start_raw)
+                end = srt_util_lib.parse_srt_time(end_raw)
             except (ValueError, IndexError):
                 continue
             subtitle_times.append((start + end) / 2)
@@ -1862,87 +879,6 @@ def screenshot_check(args: argparse.Namespace) -> None:
     print(f"Wrote contact sheet {sheet_path.resolve()}")
 
 
-def cleanup(args: argparse.Namespace) -> None:
-    episode_dir = Path(args.episode_dir).resolve()
-    if not episode_dir.exists():
-        raise SystemExit(f"Episode directory not found: {episode_dir}")
-    sentinel = episode_dir / CLEANUP_SENTINEL
-    if not sentinel.exists() and not args.force:
-        raise SystemExit(
-            f"Screenshot QA not confirmed: {sentinel.name} missing.\n"
-            f"Inspect contact sheets first, then run the pipeline with --cleanup-confirmed, "
-            f"or pass --force to skip this check."
-        )
-
-    patterns = [
-        "*.deepseek.raw.srt",
-        "*.deepseek.raw.srt.source.sha256",
-        "*.deepseek.raw.srt.dependency.sha256",
-        "*.deepseek.polished.srt",
-        "*.deepseek.polished.srt.input.sha256",
-        "*.deepseek.polished.srt.dependency.sha256",
-        "*.qa.txt",
-        "*.zh.burned.mp4",
-        "*.burned.tmp.mp4",
-        "*.subtitle_check.jpg",
-        "*.contact_sheet.jpg",
-        "*.check.*.jpg",
-        "*.orig.audit.txt",
-        "*.review.todo.txt",
-        "*.proper-nouns.txt",
-        CLEANUP_SENTINEL,
-    ]
-    removed: list[Path] = []
-    for pattern in patterns:
-        for path in episode_dir.rglob(pattern):
-            if path.is_file():
-                path.unlink()
-                removed.append(path)
-
-    cache_dirs = ["deepseek_chunks", "deepseek_polish_chunks"]
-    cache_paths: list[Path] = []
-    for dirname in cache_dirs:
-        cache_paths.extend(path for path in episode_dir.rglob(dirname) if path.is_dir())
-    cache_paths.extend(path for path in episode_dir.rglob("screenshot_check") if path.is_dir())
-    cache_paths.extend(path for path in episode_dir.rglob("*.screenshot_check") if path.is_dir())
-    for path in sorted(set(cache_paths)):
-        if path.exists() and path.is_dir():
-            if (path / ".keep").exists() or (path / ".no_cleanup").exists():
-                print(f"Skipping preserved directory {path}")
-                continue
-            import shutil
-
-            shutil.rmtree(path)
-            removed.append(path)
-
-    # Some Windows cleanup runs can leave the directory shell after deleting its files.
-    # Remove matching empty workbench directories bottom-up as a final pass.
-    for path in sorted(episode_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if not path.is_dir():
-            continue
-        if path.name in {"deepseek_chunks", "deepseek_polish_chunks"} or path.name.endswith(".screenshot_check"):
-            if (path / ".keep").exists() or (path / ".no_cleanup").exists():
-                continue
-            try:
-                next(path.iterdir())
-            except StopIteration:
-                path.rmdir()
-                removed.append(path)
-
-    combined_summary = episode_dir / f"{episode_dir.name}.summary.txt"
-    if combined_summary.exists():
-        for path in episode_dir.rglob("*.summary.txt"):
-            if path.is_file() and path.parent != episode_dir:
-                path.unlink()
-                removed.append(path)
-    else:
-        print(f"Skipping per-video summary cleanup; combined summary missing: {combined_summary}")
-
-    print(f"Removed {len(removed)} intermediate artifacts")
-    for path in removed:
-        print(path)
-
-
 def doctor(args: argparse.Namespace) -> None:
     episode_dir = Path(args.episode_dir).resolve() if args.episode_dir else Path.cwd()
     checks: list[tuple[str, bool, str]] = []
@@ -1961,11 +897,12 @@ def doctor(args: argparse.Namespace) -> None:
         "torch": "torch",
         "requests": "requests",
         "Pillow": "PIL",
-        "demucs": "demucs",
     }
     for label, module_name in required_modules.items():
         spec = importlib.util.find_spec(module_name)
         add(f"python:{label}", spec is not None, module_name if spec else "missing")
+    demucs_spec = importlib.util.find_spec("demucs")
+    add("python:demucs(optional)", demucs_spec is not None, "demucs" if demucs_spec else "missing optional package")
     spacy_spec = importlib.util.find_spec("spacy")
     add("python:spacy(optional)", spacy_spec is not None, "spacy" if spacy_spec else "missing optional package")
 
@@ -1996,6 +933,41 @@ def doctor(args: argparse.Namespace) -> None:
             add(f"glossary:{path.name}", True, str(path.resolve()))
         except OSError as exc:
             add(f"glossary:{path.name}", False, str(exc))
+
+    # Stage readiness chain (informational): reports how far this episode has
+    # progressed so the agent can decide which stage is safe to run next.
+    manifest_path = pipeline_manifest_path(episode_dir)
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            stage = manifest.get("stage")
+            status = manifest.get("status")
+            print(f"[doctor] readiness: manifest stage={stage} status={status}")
+            if isinstance(stage, str) and isinstance(status, str):
+                stop = pipeline_state_lib.stage_stop_points(stage, status, episode_dir, CLEANUP_SENTINEL)
+            else:
+                stop = manifest.get("stop_points", {})
+            for key in (
+                "post_review_stage_completed",
+                "codex_proofread_done",
+                "qa_gates_passed",
+                "screenshot_contact_sheet_inspected",
+                "cleanup_allowed",
+            ):
+                if key in stop:
+                    print(f"[doctor] readiness: {key}={stop[key]}")
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[doctor] readiness: manifest unreadable: {exc}")
+    else:
+        print("[doctor] readiness: no run manifest yet")
+    evidence = proofread_lib.evidence(episode_dir)
+    print(
+        f"[doctor] readiness: proofread_receipt={evidence['receipt_exists']} "
+        f"srt_hash_match={evidence['srt_hash_match']}"
+    )
+    if evidence.get("changed_since_receipt"):
+        print(f"[doctor] readiness: {len(evidence['changed_since_receipt'])} final SRT(s) changed since receipt")
+    print(f"[doctor] readiness: screenshot_qa_sentinel={(episode_dir / CLEANUP_SENTINEL).exists()}")
 
     failed_required = False
     for name, ok, detail in checks:
@@ -2030,14 +1002,9 @@ def combine_summaries(args: argparse.Namespace) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     combined = ("\n\n----------\n\n").join(sections).strip() + "\n"
     out.write_text(combined, encoding="utf-8-sig")
-    char_count = chinese_char_count(combined)
+    char_count = srt_util_lib.chinese_char_count(combined)
     print(f"Wrote combined summary {out.resolve()} from {len(summary_files)} files")
     print(f"summary_chinese_chars={char_count}")
-    if char_count < args.min_chars:
-        print(
-            f"[summary length warning] below soft target {args.min_chars} Chinese chars: {char_count}; "
-            "consider expanding high-value moments if coverage feels thin"
-        )
     if char_count > args.max_chars and not args.warn_only:
         raise SystemExit(f"Combined summary exceeds {args.max_chars} Chinese chars: {char_count}")
     if char_count > args.max_chars:
@@ -2072,16 +1039,16 @@ def final_ready(args: argparse.Namespace) -> None:
             if len(text_lines) > 2:
                 problems.append(f"{stem} #{number}: more than two subtitle lines")
             for line in text_lines:
-                if len(line) > args.max_line_chars or display_width(line) > args.max_line_width:
+                if len(line) > args.max_line_chars or srt_util_lib.display_width(line) > args.max_line_width:
                     problems.append(f"{stem} #{number}: long line: {line}")
-            if JA_RE.search("\n".join(text_lines)):
+            if config_lib.JA_RE.search("\n".join(text_lines)):
                 problems.append(f"{stem} #{number}: Japanese residue")
-            for token in HOOPE_RE.findall("\n".join(text_lines)):
+            for token in config_lib.HOOPE_RE.findall("\n".join(text_lines)):
                 if token != "HOOOOPE":
                     problems.append(f"{stem} #{number}: HOOOOPE spelling issue: {token}")
             try:
                 start_raw, end_raw = [part.strip() for part in timing.split("-->", 1)]
-                duration = parse_srt_time(end_raw) - parse_srt_time(start_raw)
+                duration = srt_util_lib.parse_srt_time(end_raw) - srt_util_lib.parse_srt_time(start_raw)
                 if duration > args.max_duration_seconds:
                     problems.append(f"{stem} #{number}: long duration {duration:.1f}s")
             except (ValueError, IndexError):
@@ -2090,13 +1057,8 @@ def final_ready(args: argparse.Namespace) -> None:
     if not summary.exists():
         problems.append(f"Missing combined summary: {summary.name}")
     else:
-        chars = chinese_char_count(summary.read_text(encoding="utf-8-sig"))
+        chars = srt_util_lib.chinese_char_count(summary.read_text(encoding="utf-8-sig"))
         print(f"[final-ready] summary_chinese_chars={chars}")
-        if chars < args.min_summary_chars:
-            print(
-                f"[final-ready] summary length warning: below soft target "
-                f"{args.min_summary_chars} Chinese chars: {chars}"
-            )
         if chars > args.max_summary_chars:
             problems.append(f"Combined summary exceeds {args.max_summary_chars} Chinese chars: {chars}")
     if problems:
@@ -2111,6 +1073,19 @@ def final_ready(args: argparse.Namespace) -> None:
         print("final-ready issues=0")
 
 
+def mark_proofread(args: argparse.Namespace) -> None:
+    episode_dir = require_file(Path(args.episode_dir), "Episode directory")
+    if not episode_dir.is_dir():
+        raise SystemExit(f"Episode directory not found: {episode_dir}")
+    receipt = proofread_lib.write_receipt(episode_dir, review_mode=args.review_mode)
+    evidence = proofread_lib.evidence(episode_dir)
+    print(
+        f"mark-proofread receipt={receipt.resolve()} "
+        f"hash_match={evidence.get('srt_hash_match')} "
+        f"hashed_at={evidence.get('hashed_at')}"
+    )
+
+
 def pipeline_skill_dir() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -2119,9 +1094,9 @@ def pipeline_script(name: str) -> Path:
     return pipeline_skill_dir() / "scripts" / name
 
 
-PIPELINE_DEEPSEEK_MAX_RETRIES = 3
-PIPELINE_DEEPSEEK_RETRY_DELAY = 10
-CLEANUP_SENTINEL = ".screenshot_qa_passed"
+PIPELINE_DEEPSEEK_MAX_RETRIES = config_lib.PIPELINE_DEEPSEEK_MAX_RETRIES
+PIPELINE_DEEPSEEK_RETRY_DELAY = config_lib.PIPELINE_DEEPSEEK_RETRY_DELAY
+CLEANUP_SENTINEL = config_lib.CLEANUP_SENTINEL
 
 
 def pipeline_run(cmd: list[str], dry_run: bool = False) -> None:
@@ -2130,41 +1105,31 @@ def pipeline_run(cmd: list[str], dry_run: bool = False) -> None:
         subprocess.run(cmd, check=True)
 
 
-def file_sha256(path: Path) -> str | None:
-    if not path.exists() or not path.is_file():
-        return None
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def pipeline_manifest_path(episode_dir: Path) -> Path:
     return episode_dir / ".hoooope_run_manifest.json"
 
 
-def pipeline_record_manifest(args: argparse.Namespace, episode_dir: Path, videos: list[Path], glossaries: list[str], status: str, failure: str | None = None) -> None:
-    if args.dry_run:
+def pipeline_record_manifest(config: pipeline_lib.PipelineConfig, episode_dir: Path, videos: list[Path], glossaries: list[str], status: str, failure: str | None = None) -> None:
+    if config.dry_run:
         return
     manifest = {
-        "schema": "hoooope-run-manifest-v1",
-        "stage": args.stage,
+        "schema": config_lib.MANIFEST_SCHEMA,
+        "stage": config.stage,
         "status": status,
         "failure": failure,
         "config": {
             "translate_model": PIPELINE_TRANSLATION_MODEL,
             "translate_chunk_size": PIPELINE_TRANSLATE_CHUNK_SIZE,
-            "translate_workers": getattr(args, "translate_workers", PIPELINE_TRANSLATE_WORKERS),
-            "translate_context_blocks": getattr(args, "translate_context_blocks", PIPELINE_TRANSLATE_CONTEXT_BLOCKS),
+            "translate_workers": config.translate_workers,
+            "translate_context_blocks": config.translate_context_blocks,
             "polish_chunk_size": PIPELINE_POLISH_CHUNK_SIZE,
             "polish_workers": PIPELINE_POLISH_WORKERS,
             "deepseek_qa_sample_ratio": PIPELINE_DEEPSEEK_QA_SAMPLE_RATIO,
-            "asr_main_model_dir": getattr(args, "model_dir", DEFAULT_TRANSCRIBE_MODEL_DIR),
-            "asr_enhancement": getattr(args, "asr_enhancement", "qwen-risk"),
-            "qwen_model_dir": getattr(args, "qwen_model_dir", DEFAULT_QWEN_ASR_MODEL_DIR),
+            "asr_main_model_dir": config.model_dir,
+            "asr_enhancement": config.asr_enhancement,
+            "qwen_model_dir": config.qwen_model_dir,
         },
-        "stop_points": pipeline_state_lib.stage_stop_points(args.stage, status, episode_dir, CLEANUP_SENTINEL),
+        "stop_points": pipeline_state_lib.stage_stop_points(config.stage, status, episode_dir, CLEANUP_SENTINEL),
         "glossaries": [str(Path(path).resolve()) for path in glossaries],
         "videos": [],
     }
@@ -2187,7 +1152,7 @@ def pipeline_record_manifest(args: argparse.Namespace, episode_dir: Path, videos
             "stem": stem,
             "workdir": str(workdir),
             "artifacts": {
-                name: {"path": str(path), "exists": path.exists(), "sha256": file_sha256(path)}
+                name: {"path": str(path), "exists": path.exists(), "sha256": srt_util_lib.file_sha256(path)}
                 for name, path in artifacts.items()
             },
         })
@@ -2243,6 +1208,8 @@ def pipeline_existing_glossaries(episode_dir: Path, extra: list[str] | None = No
             continue
         seen.add(resolved)
         if path.exists():
+            if "hooope_terms.txt" in path.name and "hoooope_terms.txt" not in path.name:
+                print(f"[pipeline] deprecation warning: legacy glossary name {path}; prefer hoooope_terms.txt")
             found.append(str(path))
     return found
 
@@ -2286,7 +1253,7 @@ def pipeline_maybe_run(cmd: list[str], outputs: list[Path], dry_run: bool = Fals
     pipeline_run(cmd, dry_run=dry_run)
 
 
-def pipeline_prepare_review(args: argparse.Namespace, episode_dir: Path, videos: list[Path], glossaries: list[str]) -> None:
+def pipeline_prepare_review(args: pipeline_lib.PipelineConfig, episode_dir: Path, videos: list[Path], glossaries: list[str]) -> None:
     helper = str(Path(__file__).resolve())
     translate_script = str(pipeline_script("deepseek_translate_srt.py"))
     polish_script = str(pipeline_script("deepseek_polish_srt.py"))
@@ -2414,7 +1381,7 @@ def pipeline_prepare_review(args: argparse.Namespace, episode_dir: Path, videos:
     print("[pipeline] read references/review-and-qa.md and apply only changed-block corrections to each final .srt.")
 
 
-def pipeline_post_review(args: argparse.Namespace, episode_dir: Path, videos: list[Path], glossaries: list[str]) -> None:
+def pipeline_post_review(args: pipeline_lib.PipelineConfig, episode_dir: Path, videos: list[Path], glossaries: list[str]) -> None:
     helper = str(Path(__file__).resolve())
     note_script = str(pipeline_script("deepseek_note_srt.py"))
     if args.summary_only:
@@ -2499,9 +1466,28 @@ def pipeline_post_review(args: argparse.Namespace, episode_dir: Path, videos: li
     pipeline_run([sys.executable, helper, "final-ready", str(episode_dir)], dry_run=args.dry_run)
 
 
-def pipeline_burn_cleanup(args: argparse.Namespace, episode_dir: Path, videos: list[Path]) -> None:
+def pipeline_burn_cleanup(args: pipeline_lib.PipelineConfig, episode_dir: Path, videos: list[Path]) -> None:
     helper = str(Path(__file__).resolve())
+    if args.require_proofread_evidence:
+        evidence = proofread_lib.evidence(episode_dir)
+        if not (evidence.get("receipt_exists") and evidence.get("srt_hash_match")):
+            raise SystemExit(
+                "[pipeline] burn-cleanup requires proofread receipt evidence. "
+                "Finish Codex only-corrections proofread, run mark-proofread, then rerun burn-cleanup. "
+                f"evidence={evidence}"
+            )
     pipeline_run([sys.executable, helper, "final-ready", str(episode_dir)], dry_run=args.dry_run)
+    contact_sheets = [
+        media.parent / f"{media.stem}.screenshot_check" / f"{media.stem}.contact_sheet.jpg"
+        for media in videos
+    ]
+    if args.cleanup and args.cleanup_confirmed and all(path.exists() for path in contact_sheets):
+        sentinel = episode_dir / CLEANUP_SENTINEL
+        if not args.dry_run:
+            sentinel.write_text("", encoding="utf-8")
+        print(f"[pipeline] screenshot QA confirmed from existing contact sheets; sentinel written: {sentinel.name}")
+        pipeline_run([sys.executable, helper, "cleanup", str(episode_dir)], dry_run=args.dry_run)
+        return
     for media in videos:
         final = media.with_suffix(".srt")
         pipeline_run(
@@ -2536,39 +1522,40 @@ def pipeline_burn_cleanup(args: argparse.Namespace, episode_dir: Path, videos: l
             )
 
 
-def pipeline(args: argparse.Namespace) -> None:
-    episode_dir = Path(args.episode_dir).resolve()
+def pipeline(args: argparse.Namespace | pipeline_lib.PipelineConfig) -> None:
+    config = pipeline_lib.PipelineConfig.from_namespace(args) if isinstance(args, argparse.Namespace) else args
+    episode_dir = Path(config.episode_dir).resolve()
     if not episode_dir.exists():
         raise SystemExit(f"Episode directory not found: {episode_dir}")
-    if args.summary_only and args.stage != "post-review":
+    if config.summary_only and config.stage != "post-review":
         raise SystemExit("summary-only scope allows only --stage post-review; do not organize, transcribe, burn, or cleanup MP4s.")
 
     planned_videos: list[Path] = []
-    if args.stage == "prepare-review":
-        planned_videos = pipeline_organize_root_mp4s(episode_dir, dry_run=args.dry_run)
+    if config.stage == "prepare-review":
+        planned_videos = pipeline_organize_root_mp4s(episode_dir, dry_run=config.dry_run)
     videos = pipeline_episode_videos(episode_dir)
-    if args.dry_run and args.stage == "prepare-review" and not videos:
+    if config.dry_run and config.stage == "prepare-review" and not videos:
         videos = planned_videos
-    if not videos and args.summary_only:
+    if not videos and config.summary_only:
         if not iter_final_srt_paths(episode_dir):
             raise SystemExit(f"No final Chinese SRT files found under {episode_dir} for summary-only mode")
     elif not videos:
         raise SystemExit(f"No per-video MP4 files found under {episode_dir}")
 
-    glossaries = pipeline_existing_glossaries(episode_dir, args.glossary)
-    print(f"[pipeline] stage={args.stage} videos={len(videos)} glossaries={len(glossaries)} dry_run={args.dry_run}")
+    glossaries = pipeline_existing_glossaries(episode_dir, config.glossary)
+    print(f"[pipeline] stage={config.stage} videos={len(videos)} glossaries={len(glossaries)} dry_run={config.dry_run}")
 
     try:
-        pipeline_record_manifest(args, episode_dir, videos, glossaries, "running")
-        if args.stage == "prepare-review":
-            pipeline_prepare_review(args, episode_dir, videos, glossaries)
-        elif args.stage == "post-review":
-            pipeline_post_review(args, episode_dir, videos, glossaries)
-        elif args.stage == "burn-cleanup":
-            pipeline_burn_cleanup(args, episode_dir, videos)
-        pipeline_record_manifest(args, episode_dir, videos, glossaries, "complete")
+        pipeline_record_manifest(config, episode_dir, videos, glossaries, "running")
+        if config.stage == "prepare-review":
+            pipeline_prepare_review(config, episode_dir, videos, glossaries)
+        elif config.stage == "post-review":
+            pipeline_post_review(config, episode_dir, videos, glossaries)
+        elif config.stage == "burn-cleanup":
+            pipeline_burn_cleanup(config, episode_dir, videos)
+        pipeline_record_manifest(config, episode_dir, videos, glossaries, "complete")
     except Exception as exc:
-        pipeline_record_manifest(args, episode_dir, videos, glossaries, "failed", str(exc))
+        pipeline_record_manifest(config, episode_dir, videos, glossaries, "failed", str(exc))
         raise
 
 
@@ -2632,7 +1619,7 @@ def self_test(args: argparse.Namespace) -> None:
         encoding="utf-8-sig",
     )
     tail_smooth = workdir / "tail.smooth.srt"
-    smooth_source_srt(argparse.Namespace(
+    source_smoothing_lib.smooth_source_srt(argparse.Namespace(
         subtitle=str(tail),
         output=str(tail_smooth),
         merge_gap_seconds=6.0,
@@ -2673,7 +1660,7 @@ def self_test(args: argparse.Namespace) -> None:
         encoding="utf-8-sig",
     )
     audit = workdir / "homophone.audit.txt"
-    orig_audit(argparse.Namespace(
+    final_review_lib.orig_audit(argparse.Namespace(
         subtitle=str(homophone),
         output=str(audit),
         min_chars=2,
@@ -2685,17 +1672,6 @@ def self_test(args: argparse.Namespace) -> None:
     audit_text = audit.read_text(encoding="utf-8-sig")
     if "verify against surrounding context" not in audit_text or "suggested source patch" in audit_text:
         raise SystemExit("self-test failed: homophone audit should report context risk without a fixed patch")
-
-    split_matrix = [
-        ("虽然也会被说“赶紧吃掉”，但最后还是会说着“真拿你没办法啊”然后帮我收拾掉。", 13),
-        ("HOOOOPE Battle这个环节听起来很简单，但是真的开始之后又意外地很难呢。", 25),
-        ("我在想如果是那种有点害羞的时候，可能就会怎么说呢……稍微停顿一下吧。", 16),
-    ]
-    for line, expected_index in split_matrix:
-        candidates = readable_split_candidates(line)
-        actual_index = min(candidates, key=lambda idx: split_candidate_score(line, idx, 28, 56.0))
-        if actual_index != expected_index:
-            raise SystemExit(f"self-test failed: split index changed for {line!r}: {actual_index} != {expected_index}")
 
     glossary_terms = workdir / "prompt_terms.txt"
     glossary_terms.write_text("\n".join(f"普通术语{i}" for i in range(120)), encoding="utf-8")
@@ -2935,7 +1911,7 @@ def main() -> None:
     p.add_argument("--tail-chain-max-duration-seconds", type=float, default=22.0)
     p.add_argument("--split-duration-seconds", type=float, default=8.0)
     p.add_argument("--split-chars", type=int, default=42)
-    p.set_defaults(func=smooth_source_srt)
+    p.set_defaults(func=source_smoothing_lib.smooth_source_srt)
 
     p = sub.add_parser("orig-audit", help="Audit Japanese source SRT for likely ASR source errors")
     p.add_argument("subtitle")
@@ -2946,7 +1922,7 @@ def main() -> None:
     p.add_argument("--context-window", type=int, default=2)
     p.add_argument("--fail-on-issues", action="store_true")
     p.add_argument("--audit-rules", action="append", help="Optional audit_rules.json file; can be passed multiple times")
-    p.set_defaults(func=orig_audit)
+    p.set_defaults(func=final_review_lib.orig_audit)
 
     p = sub.add_parser("qwen-compare", help="Run Qwen3-ASR on high-risk source segments and write a comparison report")
     p.add_argument("media")
@@ -2971,14 +1947,14 @@ def main() -> None:
     p.add_argument("--max-report", type=int, default=120)
     p.add_argument("--strict-public", action="store_true")
     p.add_argument("--warn-only", action="store_true")
-    p.set_defaults(func=lint_final)
+    p.set_defaults(func=final_review_lib.lint_final)
 
     p = sub.add_parser("terms-audit", help="Audit final SRT for suspicious names, brands, and fixed terms")
     p.add_argument("subtitle")
     p.add_argument("--max-report", type=int, default=160)
     p.add_argument("--warn-only", action="store_true")
     p.add_argument("--audit-rules", action="append", help="Optional audit_rules.json file; can be passed multiple times")
-    p.set_defaults(func=terms_audit)
+    p.set_defaults(func=final_review_lib.terms_audit)
 
     p = sub.add_parser("wrap-final", help="Conservatively wrap long final Chinese subtitle lines")
     p.add_argument("subtitle")
@@ -3004,14 +1980,14 @@ def main() -> None:
     p.add_argument("--include-all-long", action="store_true")
     p.add_argument("--long-text-chars", type=int, default=42)
     p.add_argument("--text-limit", type=int, default=120)
-    p.set_defaults(func=review_todo)
+    p.set_defaults(func=final_review_lib.review_todo)
 
     p = sub.add_parser("proper-noun-candidates", help="Extract possible proper nouns from Japanese source SRT")
     p.add_argument("orig")
     p.add_argument("--output")
     p.add_argument("--min-chars", type=int, default=3)
     p.add_argument("--max-terms", type=int, default=120)
-    p.set_defaults(func=proper_noun_candidates)
+    p.set_defaults(func=final_review_lib.proper_noun_candidates)
 
     p = sub.add_parser("split-srt", help="Split an SRT into numbered chunks for LLM translation")
     p.add_argument("subtitle")
@@ -3068,7 +2044,8 @@ def main() -> None:
     p = sub.add_parser("cleanup", help="Remove DeepSeek QA/raw/polished/check intermediate artifacts from an episode folder")
     p.add_argument("episode_dir")
     p.add_argument("--force", action="store_true", help="Skip screenshot QA sentinel check")
-    p.set_defaults(func=cleanup)
+    p.add_argument("--release-only", action="store_true", help="Also remove proof/manifest/sentinel files and .orig.raw.srt, leaving only release deliverables")
+    p.set_defaults(func=cleanup_lib.cleanup)
 
     p = sub.add_parser("combine-summaries", help="Combine per-video summary files into one episode-level note")
     p.add_argument("episode_dir")
@@ -3119,7 +2096,14 @@ def main() -> None:
     p.add_argument("--encoder", choices=["auto", "h264_nvenc", "libx264"], default="auto")
     p.add_argument("--cleanup", action="store_true", help="Request intermediate cleanup after burn-cleanup")
     p.add_argument("--cleanup-confirmed", action="store_true", help="Write screenshot QA sentinel file to enable cleanup")
+    p.add_argument("--no-require-proofread-evidence", dest="require_proofread_evidence", action="store_false", help="Allow burn-cleanup without a matching proofread receipt")
+    p.set_defaults(require_proofread_evidence=True)
     p.set_defaults(func=pipeline)
+
+    p = sub.add_parser("mark-proofread", help="Record a hash-anchored receipt after Codex final proofread")
+    p.add_argument("episode_dir")
+    p.add_argument("--review-mode", default=config_lib.STRICT_REVIEW_MODE)
+    p.set_defaults(func=mark_proofread)
 
     p = sub.add_parser("doctor", help="Check local HOOOOPE subtitle dependencies without network access")
     p.add_argument("episode_dir", nargs="?", help="Episode directory used to resolve local glossary/model paths")
